@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
-/// A single tone component in the signal generator.
+/// A single tone or modulated signal component in the signal generator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tone {
     /// Frequency in MHz.
@@ -16,14 +16,17 @@ pub struct Tone {
     pub amplitude_dbfs: f64,
     /// Phase offset in degrees.
     pub phase_deg: f64,
+    /// Signal bandwidth in MHz (0.0 = pure CW tone, >0.0 = modulated channel bandwidth).
+    pub bandwidth_mhz: f64,
 }
 
 impl Default for Tone {
     fn default() -> Self {
         Self {
-            frequency_mhz: 100.0,
+            frequency_mhz: 300.0,
             amplitude_dbfs: -6.0,
             phase_deg: 0.0,
+            bandwidth_mhz: 0.0,
         }
     }
 }
@@ -50,9 +53,10 @@ impl Default for SignalGenerator {
     fn default() -> Self {
         Self {
             tones: vec![Tone {
-                frequency_mhz: 500.0,
+                frequency_mhz: 300.0,
                 amplitude_dbfs: -6.0,
                 phase_deg: 0.0,
+                bandwidth_mhz: 0.0,
             }],
             noise_floor_dbfs: -80.0,
             noise_enabled: true,
@@ -69,22 +73,39 @@ impl SignalGenerator {
         let mut samples = vec![Complex::new(0.0, 0.0); num_samples];
         let dt = 1.0 / sample_rate_mhz; // time step in µs (since freq is in MHz)
 
-        // Add each tone
+        // Add each tone or modulated channel
         for tone in &self.tones {
             let amp = tone.linear_amplitude();
             let phase_rad = tone.phase_deg * PI / 180.0;
-            let omega = 2.0 * PI * tone.frequency_mhz; // rad/µs
 
-            for (i, sample) in samples.iter_mut().enumerate() {
-                let t = i as f64 * dt;
-                let angle = omega * t + phase_rad;
-                *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+            if tone.bandwidth_mhz > 0.0 {
+                // Generate a Linear Frequency Modulated (LFM Chirp) signal spanning bandwidth_mhz.
+                // A linear chirp produces a pristine, flat rectangular spectrum bounded strictly
+                // within [f_c - B/2, f_c + B/2] with zero out-of-band spectral leakage.
+                let half_bw = tone.bandwidth_mhz / 2.0;
+                let f_start = tone.frequency_mhz - half_bw;
+                let total_duration = num_samples as f64 * dt;
+                let chirp_rate = tone.bandwidth_mhz / total_duration.max(1e-12);
+
+                for (i, sample) in samples.iter_mut().enumerate() {
+                    let t = i as f64 * dt;
+                    let angle = 2.0 * PI * (f_start * t + 0.5 * chirp_rate * t * t) + phase_rad;
+                    *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                }
+            } else {
+                let omega = 2.0 * PI * tone.frequency_mhz;
+                for (i, sample) in samples.iter_mut().enumerate() {
+                    let t = i as f64 * dt;
+                    let angle = omega * t + phase_rad;
+                    *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                }
             }
         }
 
         // Add AWGN noise using a simple Box-Muller transform
         if self.noise_enabled {
-            let noise_amp = 10.0_f64.powf(self.noise_floor_dbfs / 20.0);
+            let noise_db = -self.noise_floor_dbfs.abs();
+            let noise_amp = 10.0_f64.powf(noise_db / 20.0);
             let mut seed: u64 = 0xDEAD_BEEF_CAFE_BABE;
 
             for sample in &mut samples {
@@ -255,6 +276,7 @@ mod tests {
                 frequency_mhz: 100.0,
                 amplitude_dbfs: 0.0,
                 phase_deg: 0.0,
+                bandwidth_mhz: 0.0,
             }],
             noise_floor_dbfs: -120.0,
             noise_enabled: false,

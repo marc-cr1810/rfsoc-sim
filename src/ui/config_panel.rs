@@ -166,15 +166,15 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
     });
 
     ui.separator();
-    ui.collapsing("⚡ Auto-Tune & Nyquist Planner", |ui| {
+    ui.collapsing("⚡ Auto-Tune & SDR Nyquist Planner", |ui| {
         ui.label(
-            egui::RichText::new("Enter desired target RF center frequency:")
+            egui::RichText::new("Center-tune target RF frequency to 0 Hz complex baseband:")
                 .small()
                 .color(Theme::TEXT_SECONDARY),
         );
 
         let mut target_freq = ui.data_mut(|d| {
-            *d.get_temp_mut_or_insert_with(egui::Id::new("auto_tune_target_freq"), || 5800.0)
+            *d.get_temp_mut_or_insert_with(egui::Id::new("auto_tune_target_freq"), || 300.0)
         });
 
         ui.horizontal(|ui| {
@@ -183,7 +183,7 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
                 egui::DragValue::new(&mut target_freq)
                     .range(1.0..=20000.0)
                     .suffix(" MHz")
-                    .speed(50.0),
+                    .speed(10.0),
             );
         });
 
@@ -211,16 +211,19 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
                 ui.label(res.nyquist_zone.to_string());
             });
             ui.horizontal(|ui| {
-                ui.label("Alias:");
+                ui.label("Folded Alias:");
                 ui.label(format!("{:.1} MHz", res.alias_freq_mhz));
             });
             ui.horizontal(|ui| {
-                ui.label("NCO Shift:");
-                ui.label(format!("{:.1} MHz", res.nco_freq_mhz));
+                ui.label("NCO Downshift:");
+                ui.colored_label(
+                    Theme::ACCENT_SECONDARY,
+                    format!("{:.1} MHz", res.nco_freq_mhz),
+                );
             });
         });
 
-        if ui.button("⚡ Apply Nyquist Zone & NCO").clicked() {
+        if ui.button("⚡ Apply SDR Nyquist Zone & NCO").clicked() {
             block.mixer_mode = MixerMode::FineMix;
             block.nco_freq_mhz = res.nco_freq_mhz;
             apply_auto_tune = Some(res);

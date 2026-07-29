@@ -1,6 +1,7 @@
 //! SnarlViewer implementation for the RF front end node graph.
 
 use super::nodes::*;
+use crate::ui::theme::Theme;
 use egui_snarl::ui::{PinInfo, SnarlViewer, SnarlWidget, SnarlStyle};
 use egui_snarl::{InPin, NodeId, OutPin, Snarl};
 
@@ -69,11 +70,19 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                 RfNode::SignalSource(src) => {
                     ui.horizontal(|ui| {
                         ui.label("Mode:");
-                        ui.selectable_value(&mut src.source_type, SourceType::Generator, "Gen");
+                        ui.selectable_value(&mut src.source_type, SourceType::GlobalGenerator, "Global");
+                        ui.selectable_value(&mut src.source_type, SourceType::LocalGenerator, "Local");
                         ui.selectable_value(&mut src.source_type, SourceType::IqFile, "File");
                     });
                     match src.source_type {
-                        SourceType::Generator => {
+                        SourceType::GlobalGenerator => {
+                            ui.label(
+                                egui::RichText::new("Synced to Sidebar Signal Generator")
+                                    .small()
+                                    .color(Theme::ACCENT_PRIMARY),
+                            );
+                        }
+                        SourceType::LocalGenerator => {
                             if let Some(tone) = src.generator.tones.first_mut() {
                                 egui::Grid::new(format!("src_gen_grid_{:?}", node_id))
                                     .num_columns(2)
@@ -317,3 +326,5 @@ pub fn show_node_graph(ui: &mut egui::Ui, snarl: &mut Snarl<RfNode>) {
         .style(style)
         .show(snarl, &mut RfNodeViewer, ui);
 }
+
+

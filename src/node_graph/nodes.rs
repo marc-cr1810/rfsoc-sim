@@ -92,7 +92,7 @@ pub struct SignalSourceNode {
 impl Default for SignalSourceNode {
     fn default() -> Self {
         Self {
-            source_type: SourceType::Generator,
+            source_type: SourceType::GlobalGenerator,
             generator: SignalGenerator::default(),
             file_loader: IqFileLoader::default(),
         }
@@ -101,7 +101,8 @@ impl Default for SignalSourceNode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceType {
-    Generator,
+    GlobalGenerator,
+    LocalGenerator,
     IqFile,
 }
 
@@ -193,6 +194,13 @@ impl Default for AdcInputNode {
 
 use num_complex::Complex;
 
+/// Evaluation result containing generated samples and cumulative RF chain frequency response.
+pub struct GraphEvaluationResult {
+    pub samples: Vec<Complex<f64>>,
+    pub rf_chain_response_db: Vec<f64>,
+    pub rf_chain_freq_axis_mhz: Vec<f64>,
+}
+
 /// Traverses the Snarl node graph backwards from an `AdcInput(target_tile, target_block)` node,
 /// generating complex IQ samples from an upstream `SignalSource` and applying each connected
 /// component's DSP transfer function.
@@ -202,7 +210,8 @@ pub fn evaluate_graph(
     target_block: usize,
     num_samples: usize,
     sample_rate_mhz: f64,
-) -> Option<Vec<Complex<f64>>> {
+    global_signal_gen: &SignalGenerator,
+) -> Option<GraphEvaluationResult> {
     // Find AdcInput node matching target_tile and target_block
     let mut target_adc_id = None;
     for (id, node) in snarl.node_ids() {
@@ -252,7 +261,8 @@ pub fn evaluate_graph(
     let first_node = &snarl[node_chain[0]];
     let mut current_samples = match first_node {
         RfNode::SignalSource(src) => match src.source_type {
-            SourceType::Generator => src.generator.generate(num_samples, sample_rate_mhz),
+            SourceType::GlobalGenerator => global_signal_gen.generate(num_samples, sample_rate_mhz),
+            SourceType::LocalGenerator => src.generator.generate(num_samples, sample_rate_mhz),
             SourceType::IqFile => src
                 .file_loader
                 .load()
@@ -273,7 +283,34 @@ pub fn evaluate_graph(
         };
     }
 
-    Some(current_samples)
+    // Compute cumulative frequency response curve across 0..sample_rate_mhz / 2
+    let num_resp_bins = 256;
+    let nyquist_max = sample_rate_mhz / 2.0;
+    let rf_chain_freq_axis_mhz: Vec<f64> = (0..num_resp_bins)
+        .map(|i| i as f64 * nyquist_max / (num_resp_bins - 1) as f64)
+        .collect();
+
+    let mut rf_chain_response_db = vec![0.0_f64; num_resp_bins];
+
+    for &node_id in &node_chain {
+        let node = &snarl[node_id];
+        for (bin, &freq) in rf_chain_freq_axis_mhz.iter().enumerate() {
+            match node {
+                RfNode::Balun(b) => rf_chain_response_db[bin] -= b.model.insertion_loss_at(freq),
+                RfNode::Filter(f) => rf_chain_response_db[bin] -= f.model.attenuation_at(freq),
+                RfNode::Amplifier(a) => rf_chain_response_db[bin] += a.model.gain_db,
+                RfNode::Attenuator(a) => rf_chain_response_db[bin] -= a.model.attenuation_db,
+                RfNode::Splitter(s) => rf_chain_response_db[bin] -= s.model.total_loss_db(),
+                RfNode::SignalSource(_) | RfNode::AdcInput(_) => {}
+            }
+        }
+    }
+
+    Some(GraphEvaluationResult {
+        samples: current_samples,
+        rf_chain_response_db,
+        rf_chain_freq_axis_mhz,
+    })
 }
 
 #[cfg(test)]
@@ -318,8 +355,9 @@ mod tests {
             egui_snarl::InPinId { node: adc_id, input: 0 },
         );
 
-        let samples = evaluate_graph(&snarl, 0, 0, 1024, 10000.0);
-        assert!(samples.is_some());
-        assert_eq!(samples.unwrap().len(), 1024);
+        let global_gen = crate::signal::SignalGenerator::default();
+        let res = evaluate_graph(&snarl, 0, 0, 1024, 10000.0, &global_gen);
+        assert!(res.is_some());
+        assert_eq!(res.unwrap().samples.len(), 1024);
     }
 }

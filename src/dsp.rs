@@ -10,11 +10,17 @@ use std::f64::consts::PI;
 /// Result of processing a signal through the full ADC + DDC chain.
 #[derive(Debug, Clone)]
 pub struct ProcessedSignal {
-    /// Spectrum of the input signal (before ADC), in dBFS.
+    /// Optional spectrum of raw source signal before RF chain filtering (dBFS).
+    pub raw_source_spectrum_dbfs: Option<Vec<f64>>,
+    /// Spectrum of the input signal (after RF chain filtering, before ADC), in dBFS.
     pub input_spectrum_dbfs: Vec<f64>,
     /// Frequency axis for the input spectrum, in MHz.
     pub input_freq_axis_mhz: Vec<f64>,
-    /// Spectrum after Nyquist zone folding (what the ADC samples), in dBFS.
+    /// Optional cumulative RF chain frequency response (dB).
+    pub rf_chain_response_db: Option<Vec<f64>>,
+    /// Optional frequency axis for the RF chain response (MHz).
+    pub rf_chain_freq_axis_mhz: Option<Vec<f64>>,
+    /// Spectrum after Nyquist zone folding (what the ADC sees), in dBFS.
     pub folded_spectrum_dbfs: Vec<f64>,
     /// Frequency axis for the folded spectrum (0..Fs/2), in MHz.
     pub folded_freq_axis_mhz: Vec<f64>,
@@ -30,6 +36,79 @@ pub struct ProcessedSignal {
     pub output_sample_rate_mhz: f64,
 }
 
+// ...
+
+/// Process a signal through the full ADC block pipeline.
+///
+/// Pipeline: input → fold spectrum → mix → decimate → output spectrum
+pub fn process_adc_block(
+    input_samples: &[Complex<f64>],
+    input_sample_rate_mhz: f64,
+    block: &AdcBlock,
+    tile: &AdcTile,
+    raw_source_samples: Option<&[Complex<f64>]>,
+    rf_chain_response: Option<(Vec<f64>, Vec<f64>)>,
+) -> ProcessedSignal {
+    let fft_size = 2048;
+    let fs_mhz = tile.sample_rate_mhz();
+
+    // 1. Input spectrum (full wideband)
+    let (input_spectrum, input_freq) =
+        compute_spectrum_positive(input_samples, fft_size, input_sample_rate_mhz);
+
+    let raw_source_spectrum_dbfs = raw_source_samples.map(|samples| {
+        let (raw_spec, _) = compute_spectrum_positive(samples, fft_size, input_sample_rate_mhz);
+        raw_spec
+    });
+
+    // 2. Fold into Nyquist zone (simulates ADC sampling)
+    let (folded_spectrum, folded_freq) =
+        fold_spectrum(&input_spectrum, &input_freq, fs_mhz);
+
+    // 3. Apply mixer to input time-domain samples at the input sample rate
+    let mixed_samples = apply_mixer(input_samples, block.mixer_mode, block.nco_freq_mhz, input_sample_rate_mhz);
+
+    // 4. Compute post-mixer spectrum
+    let (post_mixer_spectrum, post_mixer_freq) = if block.mixer_active() {
+        compute_spectrum(&mixed_samples, fft_size, input_sample_rate_mhz)
+    } else {
+        compute_spectrum_positive(&mixed_samples, fft_size, input_sample_rate_mhz)
+    };
+
+    // 5. Apply decimation down to the effective output rate
+    let output_rate = block.output_rate_mhz(tile.sample_rate_gsps);
+    let effective_decimation = ((input_sample_rate_mhz / output_rate).round() as u32).max(1);
+    let decimated = apply_decimation(&mixed_samples, effective_decimation);
+
+    // 6. Output spectrum
+    let output_fft_size = (fft_size / block.decimation.factor() as usize).max(64);
+    let (output_spectrum, output_freq) = if block.mixer_active() {
+        compute_spectrum(&decimated, output_fft_size, output_rate)
+    } else {
+        compute_spectrum_positive(&decimated, output_fft_size, output_rate)
+    };
+
+    let (rf_chain_response_db, rf_chain_freq_axis_mhz) = match rf_chain_response {
+        Some((resp, freq)) => (Some(resp), Some(freq)),
+        None => (None, None),
+    };
+
+    ProcessedSignal {
+        raw_source_spectrum_dbfs,
+        input_spectrum_dbfs: input_spectrum,
+        input_freq_axis_mhz: input_freq,
+        rf_chain_response_db,
+        rf_chain_freq_axis_mhz,
+        folded_spectrum_dbfs: folded_spectrum,
+        folded_freq_axis_mhz: folded_freq,
+        post_mixer_spectrum_dbfs: post_mixer_spectrum,
+        post_mixer_freq_axis_mhz: post_mixer_freq,
+        output_spectrum_dbfs: output_spectrum,
+        output_freq_axis_mhz: output_freq,
+        output_sample_rate_mhz: output_rate,
+    }
+}
+
 /// Compute the power spectrum of complex samples using FFT.
 ///
 /// Returns (magnitude_dbfs, freq_axis_mhz) where frequencies are centred around 0.
@@ -38,7 +117,10 @@ pub fn compute_spectrum(
     fft_size: usize,
     sample_rate_mhz: f64,
 ) -> (Vec<f64>, Vec<f64>) {
-    let n = fft_size.min(samples.len());
+    let n = (fft_size.min(samples.len()) / 2) * 2;
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
     let mut buffer: Vec<Complex<f64>> = samples[..n].to_vec();
 
     // Apply Hanning window
@@ -47,15 +129,12 @@ pub fn compute_spectrum(
         *sample *= w;
     }
 
-    // Zero-pad if needed
-    buffer.resize(fft_size, Complex::new(0.0, 0.0));
-
     let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(fft_size);
+    let fft = planner.plan_fft_forward(n);
     fft.process(&mut buffer);
 
     // Compute magnitude in dBFS (normalised to FFT size)
-    let norm = 1.0 / fft_size as f64;
+    let norm = 1.0 / n as f64;
     let spectrum_dbfs: Vec<f64> = buffer
         .iter()
         .map(|c| {
@@ -65,14 +144,14 @@ pub fn compute_spectrum(
         .collect();
 
     // FFT-shift: move DC to centre
-    let mut shifted = vec![0.0; fft_size];
-    let half = fft_size / 2;
+    let mut shifted = vec![0.0; n];
+    let half = n / 2;
     shifted[..half].copy_from_slice(&spectrum_dbfs[half..]);
     shifted[half..].copy_from_slice(&spectrum_dbfs[..half]);
 
     // Frequency axis (centred)
-    let freq_axis: Vec<f64> = (0..fft_size)
-        .map(|i| (i as f64 - half as f64) * sample_rate_mhz / fft_size as f64)
+    let freq_axis: Vec<f64> = (0..n)
+        .map(|i| (i as f64 - half as f64) * sample_rate_mhz / n as f64)
         .collect();
 
     (shifted, freq_axis)
@@ -84,23 +163,24 @@ pub fn compute_spectrum_positive(
     fft_size: usize,
     sample_rate_mhz: f64,
 ) -> (Vec<f64>, Vec<f64>) {
-    let n = fft_size.min(samples.len());
+    let n = (fft_size.min(samples.len()) / 2) * 2;
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
     let mut buffer: Vec<Complex<f64>> = samples[..n].to_vec();
 
-    // Hanning window
+    // Apply Hanning window
     for (i, sample) in buffer.iter_mut().enumerate() {
         let w = 0.5 * (1.0 - (2.0 * PI * i as f64 / n as f64).cos());
         *sample *= w;
     }
 
-    buffer.resize(fft_size, Complex::new(0.0, 0.0));
-
     let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(fft_size);
+    let fft = planner.plan_fft_forward(n);
     fft.process(&mut buffer);
 
-    let norm = 1.0 / fft_size as f64;
-    let half = fft_size / 2;
+    let norm = 1.0 / n as f64;
+    let half = n / 2;
 
     // Take only positive frequencies (0..Fs/2)
     let spectrum_dbfs: Vec<f64> = buffer[..=half]
@@ -112,7 +192,7 @@ pub fn compute_spectrum_positive(
         .collect();
 
     let freq_axis: Vec<f64> = (0..=half)
-        .map(|i| i as f64 * sample_rate_mhz / fft_size as f64)
+        .map(|i| i as f64 * sample_rate_mhz / n as f64)
         .collect();
 
     (spectrum_dbfs, freq_axis)
@@ -266,56 +346,7 @@ pub fn apply_decimation(samples: &[Complex<f64>], factor: u32) -> Vec<Complex<f6
     output
 }
 
-/// Process a signal through the full ADC block pipeline.
-///
-/// Pipeline: input → fold spectrum → mix → decimate → output spectrum
-pub fn process_adc_block(
-    input_samples: &[Complex<f64>],
-    input_sample_rate_mhz: f64,
-    block: &AdcBlock,
-    tile: &AdcTile,
-) -> ProcessedSignal {
-    let fft_size = 2048;
-    let fs_mhz = tile.sample_rate_mhz();
 
-    // 1. Input spectrum (full wideband)
-    let (input_spectrum, input_freq) =
-        compute_spectrum_positive(input_samples, fft_size, input_sample_rate_mhz);
-
-    // 2. Fold into Nyquist zone (simulates ADC sampling)
-    let (folded_spectrum, folded_freq) =
-        fold_spectrum(&input_spectrum, &input_freq, fs_mhz);
-
-    // 3. Generate time-domain signal at the ADC sample rate for mixer processing
-    //    Re-sample input to the ADC rate (simplified: just use input directly
-    //    since we're operating in frequency domain for display)
-    let mixed_samples = apply_mixer(input_samples, block.mixer_mode, block.nco_freq_mhz, fs_mhz);
-
-    // 4. Compute post-mixer spectrum
-    let (post_mixer_spectrum, post_mixer_freq) =
-        compute_spectrum_positive(&mixed_samples, fft_size, fs_mhz);
-
-    // 5. Apply decimation
-    let decimated = apply_decimation(&mixed_samples, block.decimation.factor());
-    let output_rate = block.output_rate_mhz(tile.sample_rate_gsps);
-
-    // 6. Output spectrum
-    let output_fft_size = (fft_size / block.decimation.factor() as usize).max(64);
-    let (output_spectrum, output_freq) =
-        compute_spectrum_positive(&decimated, output_fft_size, output_rate);
-
-    ProcessedSignal {
-        input_spectrum_dbfs: input_spectrum,
-        input_freq_axis_mhz: input_freq,
-        folded_spectrum_dbfs: folded_spectrum,
-        folded_freq_axis_mhz: folded_freq,
-        post_mixer_spectrum_dbfs: post_mixer_spectrum,
-        post_mixer_freq_axis_mhz: post_mixer_freq,
-        output_spectrum_dbfs: output_spectrum,
-        output_freq_axis_mhz: output_freq,
-        output_sample_rate_mhz: output_rate,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -423,5 +454,17 @@ mod tests {
 
         let decimated = apply_decimation(&samples, 8);
         assert_eq!(decimated.len(), 128);
+    }
+
+    #[test]
+    fn odd_sample_count_fft_shift_does_not_panic() {
+        let samples: Vec<Complex<f64>> = (0..683)
+            .map(|i| Complex::new(i as f64, 0.0))
+            .collect();
+
+        let (spec, freq) = compute_spectrum(&samples, 2048, 1000.0);
+        assert!(!spec.is_empty());
+        assert_eq!(spec.len(), freq.len());
+        assert_eq!(spec.len() % 2, 0);
     }
 }

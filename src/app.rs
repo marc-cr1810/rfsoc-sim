@@ -69,18 +69,31 @@ impl RfSocSimApp {
             return;
         }
 
-        // Generate or evaluate input signal from graph
+        // Evaluate input signal & cumulative transfer function from graph
         let num_samples = 4096;
         let input_sample_rate_mhz = 10000.0; // 10 GHz wideband
 
-        let samples = crate::node_graph::nodes::evaluate_graph(
+        let graph_res = crate::node_graph::nodes::evaluate_graph(
             &self.snarl,
             self.selected_tile,
             self.selected_block,
             num_samples,
             input_sample_rate_mhz,
-        )
-        .unwrap_or_else(|| self.signal_gen.generate(num_samples, input_sample_rate_mhz));
+            &self.signal_gen,
+        );
+
+        let (samples, rf_chain_response) = match graph_res {
+            Some(res) => (
+                res.samples,
+                Some((res.rf_chain_response_db, res.rf_chain_freq_axis_mhz)),
+            ),
+            None => (
+                self.signal_gen.generate(num_samples, input_sample_rate_mhz),
+                None,
+            ),
+        };
+
+        let raw_samples = self.signal_gen.generate(num_samples, input_sample_rate_mhz);
 
         // Process through ADC chain
         self.processed_signal = Some(dsp::process_adc_block(
@@ -88,6 +101,8 @@ impl RfSocSimApp {
             input_sample_rate_mhz,
             block,
             tile,
+            Some(&raw_samples),
+            rf_chain_response,
         ));
     }
 }
@@ -175,6 +190,15 @@ impl eframe::App for RfSocSimApp {
                                         .range(0.1..=10000.0)
                                         .suffix(" MHz")
                                         .speed(10.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("BW:");
+                                ui.add(
+                                    egui::DragValue::new(&mut tone.bandwidth_mhz)
+                                        .range(0.0..=1000.0)
+                                        .suffix(" MHz")
+                                        .speed(1.0),
                                 );
                             });
                             ui.horizontal(|ui| {
