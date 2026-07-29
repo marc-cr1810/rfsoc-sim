@@ -16,7 +16,7 @@ pub fn wideband_capture() -> RfdcConfig {
     let mut config = RfdcConfig::default();
     for tile in &mut config.adc_tiles {
         tile.sample_rate_gsps = 5.0;
-        tile.nyquist_zone = NyquistZone::Second;
+        tile.nyquist_zone = NyquistZone::SECOND;
         for block in &mut tile.blocks {
             block.mixer_mode = MixerMode::FineMix;
             block.nco_freq_mhz = 1250.0;
@@ -31,7 +31,7 @@ pub fn narrowband_ddc() -> RfdcConfig {
     let mut config = RfdcConfig::default();
     for tile in &mut config.adc_tiles {
         tile.sample_rate_gsps = 2.0;
-        tile.nyquist_zone = NyquistZone::First;
+        tile.nyquist_zone = NyquistZone::FIRST;
         for block in &mut tile.blocks {
             block.mixer_mode = MixerMode::FineMix;
             block.nco_freq_mhz = 500.0;

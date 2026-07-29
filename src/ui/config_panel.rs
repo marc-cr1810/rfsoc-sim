@@ -64,7 +64,8 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
         egui::ComboBox::from_id_salt(format!("nyquist_zone_{}", tile.index))
             .selected_text(tile.nyquist_zone.to_string())
             .show_ui(ui, |ui| {
-                for zone in NyquistZone::ALL {
+                for zone_idx in 1..=16 {
+                    let zone = NyquistZone(zone_idx);
                     if ui.selectable_value(&mut tile.nyquist_zone, zone, zone.to_string()).clicked() {
                         tile.nyquist_zone_index = zone.index();
                     }

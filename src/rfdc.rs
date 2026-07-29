@@ -63,7 +63,7 @@ impl AdcTile {
             index,
             enabled: true,
             sample_rate_gsps: 4.0,
-            nyquist_zone: NyquistZone::Zone1,
+            nyquist_zone: NyquistZone::ZONE_1,
             nyquist_zone_index: 1,
             pll_enabled: true,
             ref_clk_mhz: 245.76,
@@ -95,7 +95,7 @@ impl AdcTile {
                 target_freq_mhz,
                 zone_index: 1,
                 is_even_zone: false,
-                nyquist_zone: NyquistZone::Zone1,
+                nyquist_zone: NyquistZone(1),
                 alias_freq_mhz: target_freq_mhz,
                 nco_freq_mhz: target_freq_mhz,
             };
@@ -103,7 +103,7 @@ impl AdcTile {
 
         let zone_index = (target_freq_mhz / f_nyq).floor() as u32 + 1;
         let is_even_zone = zone_index % 2 == 0;
-        let nyquist_zone = NyquistZone::from_index(zone_index);
+        let nyquist_zone = NyquistZone(zone_index);
 
         let alias_freq_mhz = if is_even_zone {
             (zone_index as f64 * f_nyq) - target_freq_mhz
@@ -199,64 +199,40 @@ impl AdcBlock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NyquistZone {
-    Zone1,
-    Zone2,
-    Zone3,
-    Zone4,
-    Zone5,
-    Zone6,
-    Zone7,
-    Zone8,
+pub struct NyquistZone(pub u32);
+
+impl Default for NyquistZone {
+    fn default() -> Self {
+        Self(1)
+    }
 }
 
 impl NyquistZone {
-    pub const ALL: [NyquistZone; 8] = [
-        NyquistZone::Zone1,
-        NyquistZone::Zone2,
-        NyquistZone::Zone3,
-        NyquistZone::Zone4,
-        NyquistZone::Zone5,
-        NyquistZone::Zone6,
-        NyquistZone::Zone7,
-        NyquistZone::Zone8,
-    ];
+    pub fn new(index: u32) -> Self {
+        Self(index.max(1))
+    }
 
     pub fn index(&self) -> u32 {
-        match self {
-            Self::Zone1 => 1,
-            Self::Zone2 => 2,
-            Self::Zone3 => 3,
-            Self::Zone4 => 4,
-            Self::Zone5 => 5,
-            Self::Zone6 => 6,
-            Self::Zone7 => 7,
-            Self::Zone8 => 8,
-        }
+        self.0.max(1)
     }
 
-    pub fn from_index(index: u32) -> Self {
-        match index {
-            1 => Self::Zone1,
-            2 => Self::Zone2,
-            3 => Self::Zone3,
-            4 => Self::Zone4,
-            5 => Self::Zone5,
-            6 => Self::Zone6,
-            7 => Self::Zone7,
-            _ => Self::Zone8,
-        }
+    pub fn is_even(&self) -> bool {
+        self.index() % 2 == 0
     }
 
-    pub const FIRST: NyquistZone = NyquistZone::Zone1;
-    pub const SECOND: NyquistZone = NyquistZone::Zone2;
+    pub const ZONE_1: NyquistZone = NyquistZone(1);
+    pub const ZONE_2: NyquistZone = NyquistZone(2);
+    pub const ZONE_3: NyquistZone = NyquistZone(3);
+    pub const ZONE_4: NyquistZone = NyquistZone(4);
+
+    pub const FIRST: NyquistZone = NyquistZone(1);
+    pub const SECOND: NyquistZone = NyquistZone(2);
 }
 
 impl std::fmt::Display for NyquistZone {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let idx = self.index();
-        let is_even = idx % 2 == 0;
-        let mode_str = if is_even { "Even, Mirrored" } else { "Odd, Direct" };
+        let mode_str = if self.is_even() { "Even, Mirrored" } else { "Odd, Direct" };
         write!(f, "Zone {idx} ({mode_str})")
     }
 }
@@ -394,14 +370,14 @@ mod tests {
         let res = tile.auto_tune(5800.0);
         assert_eq!(res.zone_index, 3);
         assert!(!res.is_even_zone);
-        assert_eq!(res.nyquist_zone, NyquistZone::Zone3);
+        assert_eq!(res.nyquist_zone, NyquistZone(3));
         assert!((res.alias_freq_mhz - 1800.0).abs() < 1e-6);
 
         // 3000 MHz target -> 3000 / 2000 = 1.5 -> Zone 2 (Even)
         let res2 = tile.auto_tune(3000.0);
         assert_eq!(res2.zone_index, 2);
         assert!(res2.is_even_zone);
-        assert_eq!(res2.nyquist_zone, NyquistZone::Zone2);
+        assert_eq!(res2.nyquist_zone, NyquistZone(2));
         assert!((res2.alias_freq_mhz - 1000.0).abs() < 1e-6);
     }
 }

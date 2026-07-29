@@ -83,18 +83,30 @@ pub fn show_nyquist_view(
 
     // Folding explanation
     ui.label(egui::RichText::new("Zone Folding Rules:").strong());
-    for zone in 1..=num_zones {
-        let freq_start = (zone - 1) as f64 * nyquist_bw;
-        let freq_end = zone as f64 * nyquist_bw;
-        let fold_dir = if zone % 2 == 1 { "→ direct" } else { "→ mirrored" };
-        let color = Theme::zone_color(zone);
+    egui::Grid::new("nyquist_folding_rules_grid")
+        .num_columns(2)
+        .spacing([24.0, 4.0])
+        .show(ui, |ui| {
+            for zone in 1..=num_zones {
+                let freq_start = (zone - 1) as f64 * nyquist_bw;
+                let freq_end = zone as f64 * nyquist_bw;
+                let fold_dir = if zone % 2 == 1 { "☐ direct" } else { "☐ mirrored" };
+                let color = Theme::zone_color(zone);
+                let is_selected = zone == selected_zone;
 
-        ui.horizontal(|ui| {
-            ui.colored_label(color, format!("Zone {zone}"));
-            ui.label(format!(
-                "({:.0}–{:.0} MHz) {fold_dir}",
-                freq_start, freq_end
-            ));
+                ui.horizontal(|ui| {
+                    if is_selected {
+                        ui.colored_label(color, egui::RichText::new(format!("▶ Zone {zone}")).strong());
+                        ui.label(egui::RichText::new(format!("({:.0}–{:.0} MHz) {fold_dir}", freq_start, freq_end)).strong());
+                    } else {
+                        ui.colored_label(color, format!("Zone {zone}"));
+                        ui.label(format!("({:.0}–{:.0} MHz) {fold_dir}", freq_start, freq_end));
+                    }
+                });
+
+                if zone % 2 == 0 {
+                    ui.end_row();
+                }
+            }
         });
-    }
 }
