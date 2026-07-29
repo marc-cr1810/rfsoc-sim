@@ -374,11 +374,49 @@ fn show_single_spectrum(
     }
 
     plot.show(ui, |plot_ui| {
+        let min_freq = freq_axis.first().copied().unwrap_or(0.0);
+        let max_freq = freq_axis.last().copied().unwrap_or(fs_mhz / 2.0);
+
+        if !is_complex_baseband {
+            // Draw Nyquist zones in the background
+            let nyquist_bw = fs_mhz / 2.0;
+            let max_zone = (max_freq / nyquist_bw).ceil() as usize;
+            for zone in 1..=max_zone {
+                let start_f = (zone as f64 - 1.0) * nyquist_bw;
+                let end_f = (zone as f64) * nyquist_bw;
+                
+                let poly_points: PlotPoints = vec![
+                    [start_f, -150.0],
+                    [end_f, -150.0],
+                    [end_f, 10.0],
+                    [start_f, 10.0],
+                ].into();
+                
+                let poly = egui_plot::Polygon::new(
+                    format!("Nyquist Zone {zone}"),
+                    poly_points,
+                )
+                .fill_color(Theme::zone_color(zone).linear_multiply(0.05));
+                plot_ui.polygon(poly);
+
+                let boundary = zone as f64 * nyquist_bw;
+                if boundary <= max_freq {
+                    let zone_line_points: PlotPoints = vec![[boundary, -150.0], [boundary, 10.0]].into();
+                    let zone_line = Line::new(format!("{id}_zone_bound_{zone}"), zone_line_points)
+                        .color(Theme::zone_color(zone).linear_multiply(0.8))
+                        .width(1.5)
+                        .style(egui_plot::LineStyle::dashed_dense());
+                    plot_ui.line(zone_line);
+                }
+            }
+        }
+
         // Render Raw Source reference line first
         if let Some((raw_db, raw_freq)) = raw_source_overlay {
             let raw_points: PlotPoints = raw_freq
                 .iter()
                 .zip(raw_db.iter())
+                .filter(|&(&f, _)| f >= min_freq && f <= max_freq)
                 .map(|(&f, &mag)| [f, mag.max(-150.0)])
                 .collect();
 
@@ -397,7 +435,8 @@ fn show_single_spectrum(
             let overlay_points: PlotPoints = resp_freq
                 .iter()
                 .zip(resp_db.iter())
-                .map(|(&f, &db)| [f, db])
+                .filter(|&(&f, _)| f >= min_freq && f <= max_freq)
+                .map(|(&f, &db)| [f, db.max(-150.0)])
                 .collect();
 
             let overlay_line = Line::new(format!("{id}_rf_overlay"), overlay_points)
@@ -426,23 +465,6 @@ fn show_single_spectrum(
                     .width(1.5)
                     .style(egui_plot::LineStyle::Solid);
                 plot_ui.line(pk_line);
-            }
-        } else {
-            // Draw Nyquist zone boundaries
-            let nyquist_bw = fs_mhz / 2.0;
-            let max_freq = freq_axis.last().copied().unwrap_or(7500.0);
-            let max_zone = (max_freq / nyquist_bw).ceil() as usize;
-            for zone in 1..=max_zone {
-                let boundary = zone as f64 * nyquist_bw;
-                if boundary > max_freq {
-                    break;
-                }
-                let zone_line_points: PlotPoints = vec![[boundary, -150.0], [boundary, 10.0]].into();
-                let zone_line = Line::new(format!("{id}_zone_{zone}"), zone_line_points)
-                    .color(Theme::zone_color(zone).linear_multiply(0.4))
-                    .width(1.0)
-                    .style(egui_plot::LineStyle::dashed_dense());
-                plot_ui.line(zone_line);
             }
         }
     });
