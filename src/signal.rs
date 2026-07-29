@@ -7,6 +7,46 @@ use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
+/// Dynamic modulation modes for tone components.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ToneModulation {
+    /// Continuous wave (CW) with continuous phase.
+    Cw,
+    /// Linear Frequency Modulated (LFM) Chirp / FMCW Sweep.
+    SweptChirp { sweep_period_ms: f64 },
+    /// Frequency Modulation (FM).
+    FmModulated { dev_mhz: f64, mod_freq_khz: f64 },
+    /// Pulsed RF / Radar signal.
+    PulsedRadar { pulse_width_us: f64, pri_us: f64 },
+    /// Frequency Hopping Spread Spectrum.
+    FreqHopping {
+        hop_step_mhz: f64,
+        num_channels: usize,
+        hop_rate_hz: f64,
+    },
+    /// Digital QPSK modulation.
+    DigitalQpsk { symbol_rate_ksps: f64 },
+}
+
+impl Default for ToneModulation {
+    fn default() -> Self {
+        ToneModulation::Cw
+    }
+}
+
+impl std::fmt::Display for ToneModulation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToneModulation::Cw => write!(f, "CW (Tone)"),
+            ToneModulation::SweptChirp { .. } => write!(f, "FMCW Chirp Sweep"),
+            ToneModulation::FmModulated { .. } => write!(f, "FM Modulated"),
+            ToneModulation::PulsedRadar { .. } => write!(f, "Pulsed Radar"),
+            ToneModulation::FreqHopping { .. } => write!(f, "Frequency Hopping"),
+            ToneModulation::DigitalQpsk { .. } => write!(f, "Digital QPSK"),
+        }
+    }
+}
+
 /// A single tone or modulated signal component in the signal generator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tone {
@@ -18,6 +58,8 @@ pub struct Tone {
     pub phase_deg: f64,
     /// Signal bandwidth in MHz (0.0 = pure CW tone, >0.0 = modulated channel bandwidth).
     pub bandwidth_mhz: f64,
+    /// Modulation type and dynamic time-domain parameters.
+    pub modulation: ToneModulation,
 }
 
 impl Default for Tone {
@@ -27,6 +69,7 @@ impl Default for Tone {
             amplitude_dbfs: -6.0,
             phase_deg: 0.0,
             bandwidth_mhz: 0.0,
+            modulation: ToneModulation::Cw,
         }
     }
 }
@@ -57,6 +100,7 @@ impl Default for SignalGenerator {
                 amplitude_dbfs: -6.0,
                 phase_deg: 0.0,
                 bandwidth_mhz: 0.0,
+                modulation: ToneModulation::Cw,
             }],
             noise_floor_dbfs: -80.0,
             noise_enabled: true,
@@ -65,51 +109,150 @@ impl Default for SignalGenerator {
 }
 
 impl SignalGenerator {
-    /// Generate complex IQ samples.
+    /// Generate complex IQ samples at start time t = 0.
+    pub fn generate(&self, num_samples: usize, sample_rate_mhz: f64) -> Vec<Complex<f64>> {
+        self.generate_at_time(num_samples, sample_rate_mhz, 0.0)
+    }
+
+    /// Generate complex IQ samples continuously starting at `start_time_us`.
     ///
     /// - `num_samples`: number of complex samples to produce
     /// - `sample_rate_mhz`: sampling rate in MHz
-    pub fn generate(&self, num_samples: usize, sample_rate_mhz: f64) -> Vec<Complex<f64>> {
+    /// - `start_time_us`: global simulation timestamp in microseconds
+    pub fn generate_at_time(
+        &self,
+        num_samples: usize,
+        sample_rate_mhz: f64,
+        start_time_us: f64,
+    ) -> Vec<Complex<f64>> {
         let mut samples = vec![Complex::new(0.0, 0.0); num_samples];
-        let dt = 1.0 / sample_rate_mhz; // time step in µs (since freq is in MHz)
+        let dt = 1.0 / sample_rate_mhz; // time step in µs (freq is in MHz)
 
         // Add each tone or modulated channel
         for tone in &self.tones {
             let amp = tone.linear_amplitude();
             let phase_rad = tone.phase_deg * PI / 180.0;
 
-            if tone.bandwidth_mhz > 0.0 {
-                // Generate a Linear Frequency Modulated (LFM Chirp) signal spanning bandwidth_mhz.
-                // A linear chirp produces a pristine, flat rectangular spectrum bounded strictly
-                // within [f_c - B/2, f_c + B/2] with zero out-of-band spectral leakage.
-                let half_bw = tone.bandwidth_mhz / 2.0;
-                let f_start = tone.frequency_mhz - half_bw;
-                let total_duration = num_samples as f64 * dt;
-                let chirp_rate = tone.bandwidth_mhz / total_duration.max(1e-12);
+            match &tone.modulation {
+                ToneModulation::SweptChirp { sweep_period_ms } => {
+                    let sweep_period_us = (sweep_period_ms * 1000.0).max(1.0);
+                    let bw = if tone.bandwidth_mhz > 0.0 {
+                        tone.bandwidth_mhz
+                    } else {
+                        100.0
+                    };
+                    let half_bw = bw / 2.0;
+                    let f_start = tone.frequency_mhz - half_bw;
 
-                for (i, sample) in samples.iter_mut().enumerate() {
-                    let t = i as f64 * dt;
-                    let angle = 2.0 * PI * (f_start * t + 0.5 * chirp_rate * t * t) + phase_rad;
-                    *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let t_us = start_time_us + i as f64 * dt;
+                        let t_rel = t_us % sweep_period_us;
+                        let chirp_rate = bw / sweep_period_us;
+                        let angle = 2.0 * PI * (f_start * t_rel + 0.5 * chirp_rate * t_rel * t_rel)
+                            + phase_rad;
+                        *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                    }
                 }
-            } else {
-                let omega = 2.0 * PI * tone.frequency_mhz;
-                for (i, sample) in samples.iter_mut().enumerate() {
-                    let t = i as f64 * dt;
-                    let angle = omega * t + phase_rad;
-                    *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                ToneModulation::FmModulated {
+                    dev_mhz,
+                    mod_freq_khz,
+                } => {
+                    let f_m_mhz = mod_freq_khz / 1000.0;
+                    let beta = if f_m_mhz > 0.0 {
+                        dev_mhz / f_m_mhz
+                    } else {
+                        0.0
+                    };
+                    let c_period = 1.0 / tone.frequency_mhz.max(1e-6);
+                    let m_period = if f_m_mhz > 0.0 { 1.0 / f_m_mhz } else { 1000.0 };
+                    let t_c_start = start_time_us % c_period;
+                    let t_m_start = start_time_us % m_period;
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let t_c = t_c_start + i as f64 * dt;
+                        let t_m = t_m_start + i as f64 * dt;
+                        let angle = 2.0 * PI * tone.frequency_mhz * t_c
+                            + beta * (2.0 * PI * f_m_mhz * t_m).sin()
+                            + phase_rad;
+                        *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                    }
+                }
+                ToneModulation::PulsedRadar {
+                    pulse_width_us,
+                    pri_us,
+                } => {
+                    let pri = pri_us.max(1.0);
+                    let pw = pulse_width_us.min(pri);
+                    let c_period = 1.0 / tone.frequency_mhz.max(1e-6);
+                    let t_c_start = start_time_us % c_period;
+                    let phase_start = 2.0 * PI * tone.frequency_mhz * t_c_start + phase_rad;
+                    let phase_step = 2.0 * PI * tone.frequency_mhz * dt;
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let t_us = start_time_us + i as f64 * dt;
+                        let t_rel = t_us % pri;
+                        let pulse_env = if t_rel <= pw { 1.0 } else { 0.0 };
+                        let angle = phase_start + i as f64 * phase_step;
+                        *sample += Complex::new(amp * pulse_env * angle.cos(), amp * pulse_env * angle.sin());
+                    }
+                }
+                ToneModulation::FreqHopping {
+                    hop_step_mhz,
+                    num_channels,
+                    hop_rate_hz,
+                } => {
+                    let n_chan = (*num_channels).max(1);
+                    let hop_dur_us = 1_000_000.0 / hop_rate_hz.max(1.0);
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let t_us = start_time_us + i as f64 * dt;
+                        let hop_idx = (t_us / hop_dur_us).floor() as u64;
+                        let chan = ((hop_idx * 7 + 3) as usize) % n_chan;
+                        let chan_offset = (chan as f64 - (n_chan as f64 - 1.0) / 2.0) * hop_step_mhz;
+                        let inst_freq = tone.frequency_mhz + chan_offset;
+                        let c_period = 1.0 / inst_freq.max(1e-6);
+                        let t_c_start = t_us % c_period;
+                        let angle = 2.0 * PI * inst_freq * t_c_start + phase_rad;
+                        *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                    }
+                }
+                ToneModulation::DigitalQpsk { symbol_rate_ksps } => {
+                    let sym_dur_us = 1_000.0 / symbol_rate_ksps.max(0.1);
+                    let c_period = 1.0 / tone.frequency_mhz.max(1e-6);
+                    let t_c_start = start_time_us % c_period;
+                    let phase_start = 2.0 * PI * tone.frequency_mhz * t_c_start + phase_rad;
+                    let phase_step = 2.0 * PI * tone.frequency_mhz * dt;
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let t_us = start_time_us + i as f64 * dt;
+                        let sym_idx = (t_us / sym_dur_us).floor() as u64;
+                        let sym_phase = (sym_idx * 3 + 1) % 4;
+                        let qpsk_angle = (sym_phase as f64) * PI / 2.0 + PI / 4.0;
+                        let angle = phase_start + i as f64 * phase_step + qpsk_angle;
+                        *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                    }
+                }
+                ToneModulation::Cw => {
+                    let period_us = 1.0 / tone.frequency_mhz.max(1e-6);
+                    let t_phase_start = start_time_us % period_us;
+                    let phase_start = 2.0 * PI * tone.frequency_mhz * t_phase_start + phase_rad;
+                    let phase_step = 2.0 * PI * tone.frequency_mhz * dt;
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let angle = phase_start + i as f64 * phase_step;
+                        *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                    }
                 }
             }
         }
 
-        // Add AWGN noise using a simple Box-Muller transform
+        // Add AWGN noise using Box-Muller transform
         if self.noise_enabled {
             let noise_db = -self.noise_floor_dbfs.abs();
             let noise_amp = 10.0_f64.powf(noise_db / 20.0);
-            let mut seed: u64 = 0xDEAD_BEEF_CAFE_BABE;
+            let mut seed: u64 = 0xDEAD_BEEF_CAFE_BABE ^ (start_time_us.to_bits());
 
             for sample in &mut samples {
-                // Simple xorshift64 PRNG (good enough for visualization)
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
@@ -119,7 +262,6 @@ impl SignalGenerator {
                 seed ^= seed << 17;
                 let u2 = (seed as f64) / (u64::MAX as f64);
 
-                // Box-Muller transform
                 let r = (-2.0 * u1.max(1e-300).ln()).sqrt();
                 let theta = 2.0 * PI * u2;
                 *sample += Complex::new(noise_amp * r * theta.cos(), noise_amp * r * theta.sin());
@@ -277,6 +419,7 @@ mod tests {
                 amplitude_dbfs: 0.0,
                 phase_deg: 0.0,
                 bandwidth_mhz: 0.0,
+                modulation: ToneModulation::Cw,
             }],
             noise_floor_dbfs: -120.0,
             noise_enabled: false,
@@ -294,5 +437,66 @@ mod tests {
         };
         // -6 dBFS ≈ 0.501
         assert!((t.linear_amplitude() - 0.501).abs() < 0.01);
+    }
+
+    #[test]
+    fn time_advancing_phase_continuity() {
+        let sig_gen = SignalGenerator {
+            tones: vec![Tone {
+                frequency_mhz: 100.0,
+                amplitude_dbfs: 0.0,
+                phase_deg: 0.0,
+                bandwidth_mhz: 0.0,
+                modulation: ToneModulation::Cw,
+            }],
+            noise_floor_dbfs: -120.0,
+            noise_enabled: false,
+        };
+        let sample_rate = 1000.0;
+        let num_samples = 100;
+        let dt = 1.0 / sample_rate; // 0.001 us per sample
+
+        // Generate chunk 1 from t = 0..100 us
+        let _chunk1 = sig_gen.generate_at_time(num_samples, sample_rate, 0.0);
+        // Generate chunk 2 from t = 100 us
+        let t_start_chunk2 = num_samples as f64 * dt;
+        let chunk2 = sig_gen.generate_at_time(num_samples, sample_rate, t_start_chunk2);
+
+        // Continuous generation of 200 samples
+        let continuous = sig_gen.generate_at_time(200, sample_rate, 0.0);
+
+        // First sample of chunk 2 should equal sample 100 of continuous generation
+        let diff = (chunk2[0] - continuous[100]).norm();
+        assert!(diff < 1e-9, "Phase discontinuity between consecutive time chunks!");
+    }
+
+    #[test]
+    fn modulation_modes_energy() {
+        let modes = vec![
+            ToneModulation::Cw,
+            ToneModulation::SweptChirp { sweep_period_ms: 5.0 },
+            ToneModulation::FmModulated { dev_mhz: 10.0, mod_freq_khz: 5.0 },
+            ToneModulation::PulsedRadar { pulse_width_us: 50.0, pri_us: 100.0 },
+            ToneModulation::FreqHopping { hop_step_mhz: 20.0, num_channels: 4, hop_rate_hz: 100.0 },
+            ToneModulation::DigitalQpsk { symbol_rate_ksps: 50.0 },
+        ];
+
+        for mod_mode in modes {
+            let sig_generator = SignalGenerator {
+                tones: vec![Tone {
+                    frequency_mhz: 200.0,
+                    amplitude_dbfs: -3.0,
+                    phase_deg: 0.0,
+                    bandwidth_mhz: 50.0,
+                    modulation: mod_mode,
+                }],
+                noise_floor_dbfs: -100.0,
+                noise_enabled: false,
+            };
+
+            let samples = sig_generator.generate_at_time(512, 1000.0, 10.0);
+            let energy: f64 = samples.iter().map(|s| s.norm_sqr()).sum();
+            assert!(energy > 0.0, "Modulated tone produced zero energy");
+        }
     }
 }

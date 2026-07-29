@@ -126,7 +126,106 @@ pub fn show_spectrum_view(
 
         ui.add_space(4.0);
 
-        // 4. Spectrogram / Waterfall Display (Always Open & Prominent)
+        // 4. Real-Time Oscilloscope & Constellation Viewers
+        ui.collapsing("📈 Real-Time Baseband Oscilloscope & IQ Constellation", |ui| {
+            ui.columns(2, |cols| {
+                // Column 1: Time-domain Oscilloscope
+                cols[0].group(|ui| {
+                    ui.label(
+                        egui::RichText::new("📉 Time-Domain Oscilloscope")
+                            .strong()
+                            .color(Theme::ACCENT_PRIMARY),
+                    );
+
+                    let num_pts = signal.output_time_samples.len().min(300);
+                    let dt = 1.0 / signal.output_sample_rate_mhz; // µs
+
+                    let i_points: PlotPoints = signal.output_time_samples[..num_pts]
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, c)| [idx as f64 * dt, c.re])
+                        .collect();
+
+                    let q_points: PlotPoints = signal.output_time_samples[..num_pts]
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, c)| [idx as f64 * dt, c.im])
+                        .collect();
+
+                    let env_points: PlotPoints = signal.output_time_samples[..num_pts]
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, c)| [idx as f64 * dt, c.norm()])
+                        .collect();
+
+                    let line_i = Line::new("I(t)", i_points)
+                        .color(egui::Color32::from_rgb(0, 200, 255))
+                        .width(1.5);
+                    let line_q = Line::new("Q(t)", q_points)
+                        .color(egui::Color32::from_rgb(255, 180, 0))
+                        .width(1.5);
+                    let line_env = Line::new("|I+jQ|", env_points)
+                        .color(egui::Color32::from_rgb(200, 100, 255))
+                        .width(1.0)
+                        .style(egui_plot::LineStyle::dashed_dense());
+
+                    Plot::new("oscilloscope_plot")
+                        .height(150.0)
+                        .x_axis_label("Time (µs)")
+                        .y_axis_label("Amplitude")
+                        .include_y(-1.2)
+                        .include_y(1.2)
+                        .show(ui, |plot_ui| {
+                            plot_ui.line(line_i);
+                            plot_ui.line(line_q);
+                            plot_ui.line(line_env);
+                        });
+                });
+
+                // Column 2: IQ Constellation Scatter Plot
+                cols[1].group(|ui| {
+                    ui.label(
+                        egui::RichText::new("🎯 IQ Constellation Diagram")
+                            .strong()
+                            .color(Theme::ACCENT_SECONDARY),
+                    );
+
+                    let num_pts = signal.output_time_samples.len().min(400);
+                    let points: PlotPoints = signal.output_time_samples[..num_pts]
+                        .iter()
+                        .map(|c| [c.re, c.im])
+                        .collect();
+
+                    let traj_line = Line::new("IQ_trajectory", points)
+                        .color(Theme::ACCENT_SECONDARY.linear_multiply(0.6))
+                        .width(1.0);
+
+                    let points_scatter = egui_plot::Points::new("IQ_symbols", signal.output_time_samples[..num_pts]
+                        .iter()
+                        .map(|c| [c.re, c.im])
+                        .collect::<PlotPoints>())
+                        .color(Theme::ACCENT_PRIMARY)
+                        .radius(2.0);
+
+                    Plot::new("iq_constellation_plot")
+                        .height(150.0)
+                        .x_axis_label("In-Phase I")
+                        .y_axis_label("Quadrature Q")
+                        .include_x(-1.2)
+                        .include_x(1.2)
+                        .include_y(-1.2)
+                        .include_y(1.2)
+                        .show(ui, |plot_ui| {
+                            plot_ui.line(traj_line);
+                            plot_ui.points(points_scatter);
+                        });
+                });
+            });
+        });
+
+        ui.add_space(4.0);
+
+        // 5. Spectrogram / Waterfall Display (Always Open & Prominent)
         WATERFALL_BUFFER.with(|buf| {
             let mut history = buf.borrow_mut();
             let new_len = signal.output_spectrum_dbfs.len();

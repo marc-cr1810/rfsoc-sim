@@ -231,6 +231,7 @@ pub fn evaluate_graph(
     num_samples: usize,
     sample_rate_mhz: f64,
     global_signal_gen: &SignalGenerator,
+    time_us: f64,
 ) -> Option<GraphEvaluationResult> {
     // Find AdcInput node matching target_tile and target_block
     let mut target_adc_id = None;
@@ -281,12 +282,12 @@ pub fn evaluate_graph(
     let first_node = &snarl[node_chain[0]];
     let mut current_samples = match first_node {
         RfNode::SignalSource(src) => match src.source_type {
-            SourceType::GlobalGenerator => global_signal_gen.generate(num_samples, sample_rate_mhz),
-            SourceType::LocalGenerator => src.generator.generate(num_samples, sample_rate_mhz),
+            SourceType::GlobalGenerator => global_signal_gen.generate_at_time(num_samples, sample_rate_mhz, time_us),
+            SourceType::LocalGenerator => src.generator.generate_at_time(num_samples, sample_rate_mhz, time_us),
             SourceType::IqFile => src
                 .file_loader
                 .load()
-                .unwrap_or_else(|_| src.generator.generate(num_samples, sample_rate_mhz)),
+                .unwrap_or_else(|_| src.generator.generate_at_time(num_samples, sample_rate_mhz, time_us)),
         },
         _ => return None,
     };
@@ -432,7 +433,7 @@ mod tests {
         );
 
         let global_gen = crate::signal::SignalGenerator::default();
-        let res = evaluate_graph(&snarl, 0, 0, 1024, 10000.0, &global_gen);
+        let res = evaluate_graph(&snarl, 0, 0, 1024, 10000.0, &global_gen, 0.0);
         assert!(res.is_some());
         assert_eq!(res.unwrap().samples.len(), 1024);
     }
@@ -479,7 +480,7 @@ mod tests {
         );
 
         let global_gen = crate::signal::SignalGenerator::default();
-        let res = evaluate_graph(&snarl, 0, 0, 1024, 10000.0, &global_gen).unwrap();
+        let res = evaluate_graph(&snarl, 0, 0, 1024, 10000.0, &global_gen, 0.0).unwrap();
 
         // Total Gain = 30 dB
         assert!((res.cascaded_gain_db - 30.0).abs() < 1e-3);

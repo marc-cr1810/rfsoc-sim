@@ -34,6 +34,8 @@ pub struct ProcessedSignal {
     pub output_freq_axis_mhz: Vec<f64>,
     /// Effective output sample rate in MHz.
     pub output_sample_rate_mhz: f64,
+    /// Complex baseband output time-domain samples (for oscilloscope & constellation).
+    pub output_time_samples: Vec<Complex<f64>>,
 }
 
 // ...
@@ -256,6 +258,7 @@ pub fn process_adc_block(
         output_spectrum_dbfs: output_spectrum,
         output_freq_axis_mhz: output_freq,
         output_sample_rate_mhz: output_rate,
+        output_time_samples: decimated,
     }
 }
 
