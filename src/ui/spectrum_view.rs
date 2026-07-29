@@ -6,8 +6,25 @@ use egui_plot::{Line, Plot, PlotPoints};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
+struct WaterfallState {
+    paused: bool,
+    min_db: f64,
+    max_db: f64,
+}
+
+impl Default for WaterfallState {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            min_db: -140.0,
+            max_db: 0.0,
+        }
+    }
+}
+
 thread_local! {
     static WATERFALL_BUFFER: RefCell<VecDeque<Vec<f64>>> = RefCell::new(VecDeque::new());
+    static WATERFALL_STATE: RefCell<WaterfallState> = RefCell::new(WaterfallState::default());
 }
 
 /// A detected spectral peak.
@@ -88,6 +105,7 @@ pub fn show_spectrum_view(
             rf_chain_overlay,
             raw_source_overlay,
             false,
+            None,
         );
 
         ui.add_space(4.0);
@@ -105,9 +123,12 @@ pub fn show_spectrum_view(
             None,
             None,
             false,
+            None,
         );
 
         ui.add_space(4.0);
+
+        let link_group = ui.id().with("baseband_x_link");
 
         // 3. Post-DDC Spectrum with Peak & Delta Markers
         show_single_spectrum(
@@ -126,6 +147,7 @@ pub fn show_spectrum_view(
             None,
             None,
             true,
+            Some(link_group),
         );
 
         ui.add_space(4.0);
@@ -230,72 +252,155 @@ pub fn show_spectrum_view(
         ui.add_space(4.0);
 
         // 5. Spectrogram / Waterfall Display (Always Open & Prominent)
-        WATERFALL_BUFFER.with(|buf| {
-            let mut history = buf.borrow_mut();
-            let new_len = signal.output_spectrum_dbfs.len();
+        WATERFALL_STATE.with(|state_rc| {
+            let mut state = state_rc.borrow_mut();
 
-            // Clear history if spectrum length changed (e.g. decimation or FFT size updated)
-            if let Some(front) = history.front() {
-                if front.len() != new_len {
-                    history.clear();
+            WATERFALL_BUFFER.with(|buf| {
+                let mut history = buf.borrow_mut();
+                let new_len = signal.output_spectrum_dbfs.len();
+
+                // Clear history if spectrum length changed (e.g. decimation or FFT size updated)
+                if let Some(front) = history.front() {
+                    if front.len() != new_len {
+                        history.clear();
+                    }
                 }
-            }
 
-            if new_len > 0 {
-                if history.len() >= 60 {
-                    history.pop_back();
+                if new_len > 0 && !state.paused {
+                    if history.len() >= 256 {
+                        history.pop_back();
+                    }
+                    history.push_front(signal.output_spectrum_dbfs.clone());
                 }
-                history.push_front(signal.output_spectrum_dbfs.clone());
-            }
 
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("🌊 Real-Time Spectrogram / Waterfall Plot")
-                            .strong()
-                            .size(13.0)
-                            .color(Theme::ACCENT_PRIMARY),
-                    );
-                    ui.colored_label(
-                        Theme::TEXT_SECONDARY,
-                        "(Vertical: Time [latest on top], Horizontal: Frequency, Color: dBFS intensity)",
-                    );
-                });
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("🌊 Real-Time Spectrogram / Waterfall Plot")
+                                .strong()
+                                .size(13.0)
+                                .color(Theme::ACCENT_PRIMARY),
+                        );
+                        ui.colored_label(
+                            Theme::TEXT_SECONDARY,
+                            "(Vertical: Time [latest on top], Horizontal: Frequency, Color: dBFS intensity)",
+                        );
 
-                let width = new_len;
-                let height = history.len();
-                if width > 0 && height > 0 {
-                    let mut pixels = Vec::with_capacity(width * height);
-                    for row in history.iter() {
-                        if row.len() == width {
-                            for &mag in row.iter() {
-                                // Map dBFS (-140 to 0) to thermal colormap
-                                let norm = ((mag + 140.0) / 140.0).clamp(0.0, 1.0);
-                                let r = (norm * 2.5).clamp(0.0, 1.0);
-                                let g = (norm * 2.0 - 0.5).clamp(0.0, 1.0);
-                                let b = (1.0 - norm * 2.0).clamp(0.0, 1.0);
-                                pixels.push(egui::Color32::from_rgb(
-                                    (r * 255.0) as u8,
-                                    (g * 255.0) as u8,
-                                    (b * 255.0) as u8,
-                                ));
+                        // Controls
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("🗑 Clear").clicked() {
+                                history.clear();
+                            }
+                            if ui.button(if state.paused { "▶ Resume" } else { "⏸ Freeze" }).clicked() {
+                                state.paused = !state.paused;
+                            }
+                            
+                            ui.add(egui::Slider::new(&mut state.max_db, -150.0..=20.0).text("Max dB"));
+                            ui.add(egui::Slider::new(&mut state.min_db, -150.0..=20.0).text("Min dB"));
+                            
+                            // Colorbar Legend
+                            let mut legend_pixels = Vec::with_capacity(60 * 10);
+                            for _y in 0..10 {
+                                for x in 0..60 {
+                                    let norm = x as f64 / 59.0;
+                                    let r = (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+                                    let g = (norm * 3.0 - 2.0).clamp(0.0, 1.0);
+                                    let b = (norm * 3.0).clamp(0.0, 1.0) - (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+                                    legend_pixels.push(egui::Color32::from_rgb(
+                                        (r * 255.0) as u8,
+                                        (g * 255.0) as u8,
+                                        (b * 255.0) as u8,
+                                    ));
+                                }
+                            }
+                            let legend_img = egui::ColorImage::new([60, 10], legend_pixels);
+                            let legend_tex = ui.ctx().load_texture("waterfall_legend", legend_img, egui::TextureOptions::LINEAR);
+                            ui.add(egui::Image::new(&legend_tex).fit_to_exact_size(egui::vec2(60.0, 10.0)));
+                            ui.label(egui::RichText::new("Legend:").color(Theme::TEXT_SECONDARY));
+                        });
+                    });
+
+                    let width = new_len;
+                    let height = history.len();
+                    if width > 0 && height > 0 {
+                        let mut pixels = Vec::with_capacity(width * height);
+                        let range_db = (state.max_db - state.min_db).max(0.1);
+
+                        for row in history.iter() {
+                            if row.len() == width {
+                                for &mag in row.iter() {
+                                    // Map dBFS using dynamic range
+                                    let norm = ((mag - state.min_db) / range_db).clamp(0.0, 1.0);
+                                    
+                                    // Magma/Inferno style colormap: Black -> Blue -> Purple -> Red -> Yellow
+                                    let r = (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+                                    let g = (norm * 3.0 - 2.0).clamp(0.0, 1.0);
+                                    let b = (norm * 3.0).clamp(0.0, 1.0) - (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+
+                                    pixels.push(egui::Color32::from_rgb(
+                                        (r * 255.0) as u8,
+                                        (g * 255.0) as u8,
+                                        (b * 255.0) as u8,
+                                    ));
+                                }
+                            }
+                        }
+
+                        if pixels.len() == width * height {
+                            let img = egui::ColorImage::new([width, height], pixels);
+                            let texture = ui.ctx().load_texture(
+                                "waterfall_texture",
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            
+                            let plot = egui_plot::Plot::new("waterfall_plot")
+                                .height(250.0)
+                                .allow_drag(true)
+                                .allow_zoom(true)
+                                .link_axis(link_group, [true, false])
+                                .show_axes([true, false])
+                                .x_axis_label("Baseband Offset Frequency (MHz)")
+                                .show_grid(false);
+                            
+                            let inner = plot.show(ui, |plot_ui| {
+                                let x_min = -signal.output_sample_rate_mhz / 2.0;
+                                let x_max = signal.output_sample_rate_mhz / 2.0;
+                                
+                                let image = egui_plot::PlotImage::new(
+                                    "waterfall_img",
+                                    texture.id(),
+                                    egui_plot::PlotPoint::new((x_max + x_min) / 2.0, height as f64 / 2.0),
+                                    [(x_max - x_min) as f32, height as f32],
+                                );
+                                plot_ui.image(image);
+                                
+                                plot_ui.pointer_coordinate()
+                            });
+
+                            if let Some(coord) = inner.inner {
+                                inner.response.on_hover_ui_at_pointer(|ui| {
+                                    let frame_idx = (coord.y.round() as usize).clamp(0, height.saturating_sub(1));
+                                    
+                                    let x_min = -signal.output_sample_rate_mhz / 2.0;
+                                    let x_max = signal.output_sample_rate_mhz / 2.0;
+                                    let freq_span = x_max - x_min;
+                                    let x_norm = ((coord.x - x_min) / freq_span).clamp(0.0, 1.0);
+                                    let bin_idx = (x_norm * (width as f64 - 1.0)).round() as usize;
+
+                                    let mag = history.get(frame_idx)
+                                        .and_then(|row| row.get(bin_idx))
+                                        .copied()
+                                        .unwrap_or(-150.0);
+
+                                    ui.label(egui::RichText::new(format!("Freq: {:.3} MHz", coord.x)).strong());
+                                    ui.label(format!("Time: {} frames ago", frame_idx));
+                                    ui.label(format!("Magnitude: {:.1} dBFS", mag));
+                                });
                             }
                         }
                     }
-
-                    if pixels.len() == width * height {
-                        let img = egui::ColorImage::new([width, height], pixels);
-                        let texture = ui.ctx().load_texture(
-                            "waterfall_texture",
-                            img,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        ui.add(
-                            egui::Image::new(&texture)
-                                .fit_to_exact_size(egui::vec2(ui.available_width(), 130.0)),
-                        );
-                    }
-                }
+                });
             });
         });
     } else {
@@ -318,6 +423,7 @@ fn show_single_spectrum(
     rf_overlay: Option<(&[f64], &[f64])>,
     raw_source_overlay: Option<(&[f64], &[f64])>,
     is_complex_baseband: bool,
+    link_group: Option<egui::Id>,
 ) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).strong().size(13.0));
@@ -354,8 +460,24 @@ fn show_single_spectrum(
 
     let line = Line::new(id, points).color(color).width(1.5);
 
+    let label_fmt = |pos: &egui_plot::HoverPosition<'_>| {
+        match pos {
+            egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } => {
+                if plot_name.is_empty() {
+                    Some(format!("Freq: {:.2} MHz\nMag: {:.1} dBFS", position.x, position.y))
+                } else {
+                    Some(format!("{plot_name}\nFreq: {:.2} MHz\nMag: {:.1} dBFS", position.x, position.y))
+                }
+            }
+            egui_plot::HoverPosition::Elsewhere { position } => {
+                Some(format!("Freq: {:.2} MHz\nMag: {:.1} dBFS", position.x, position.y))
+            }
+        }
+    };
+
     let mut plot = Plot::new(id)
         .height(height)
+        .label_formatter(label_fmt)
         .x_axis_label(if is_complex_baseband {
             "Baseband Offset Frequency (MHz)"
         } else {
@@ -364,6 +486,10 @@ fn show_single_spectrum(
         .y_axis_label("Magnitude (dBFS)")
         .include_y(-150.0)
         .include_y(10.0);
+
+    if let Some(lg) = link_group {
+        plot = plot.link_axis(lg, [true, false]);
+    }
 
     if is_complex_baseband {
         let span = fs_mhz / 2.0;
