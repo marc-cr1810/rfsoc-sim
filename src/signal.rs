@@ -277,6 +277,8 @@ pub enum IqFormat {
     BinaryF32,
     /// Binary interleaved f64: I0, Q0, I1, Q1, ...
     BinaryF64,
+    /// Binary interleaved i16: I0, Q0, I1, Q1, ... (scaled to [-1, 1])
+    Sc16,
     /// CSV with I, Q columns
     Csv,
 }
@@ -284,8 +286,9 @@ pub enum IqFormat {
 impl std::fmt::Display for IqFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IqFormat::BinaryF32 => write!(f, "Binary f32"),
-            IqFormat::BinaryF64 => write!(f, "Binary f64"),
+            IqFormat::BinaryF32 => write!(f, "Binary f32 (fc32)"),
+            IqFormat::BinaryF64 => write!(f, "Binary f64 (fc64)"),
+            IqFormat::Sc16 => write!(f, "Binary i16 (sc16)"),
             IqFormat::Csv => write!(f, "CSV (I, Q)"),
         }
     }
@@ -298,8 +301,17 @@ pub struct IqFileLoader {
     pub path: Option<PathBuf>,
     /// Format of the IQ data.
     pub format: IqFormat,
-    /// Sample rate of the loaded data in MHz.
+    /// Sample rate of the captured data in the file in MHz.
     pub sample_rate_mhz: f64,
+    /// Whether to repeat the playback when the file ends.
+    pub repeat: bool,
+    /// Idle period in microseconds to wait between repeats.
+    pub repeat_period_us: f64,
+    
+    #[serde(skip)]
+    pub cached_samples: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Vec<Complex<f64>>>>>>,
+    #[serde(skip)]
+    pub last_path_loaded: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
 impl Default for IqFileLoader {
@@ -308,17 +320,29 @@ impl Default for IqFileLoader {
             path: None,
             format: IqFormat::BinaryF32,
             sample_rate_mhz: 1000.0,
+            repeat: true,
+            repeat_period_us: 0.0,
+            cached_samples: Default::default(),
+            last_path_loaded: Default::default(),
         }
     }
 }
 
 impl IqFileLoader {
     /// Load IQ samples from the configured file.
-    pub fn load(&self) -> Result<Vec<Complex<f64>>, String> {
+    pub fn load(&self) -> Result<std::sync::Arc<Vec<Complex<f64>>>, String> {
         let path = self.path.as_ref().ok_or("No file path set")?;
+        
+        let mut last_path = self.last_path_loaded.lock().unwrap();
+        let mut cache = self.cached_samples.lock().unwrap();
+        
+        if last_path.as_ref() == Some(path) && cache.is_some() {
+            return Ok(cache.as_ref().unwrap().clone());
+        }
+
         let data = std::fs::read(path).map_err(|e| format!("Failed to read file: {e}"))?;
 
-        match self.format {
+        let samples_vec = match self.format {
             IqFormat::BinaryF32 => {
                 if data.len() % 8 != 0 {
                     return Err("File size not a multiple of 8 bytes (2 × f32)".into());
@@ -331,7 +355,7 @@ impl IqFileLoader {
                         Complex::new(i as f64, q as f64)
                     })
                     .collect();
-                Ok(samples)
+                samples
             }
             IqFormat::BinaryF64 => {
                 if data.len() % 16 != 0 {
@@ -345,7 +369,21 @@ impl IqFileLoader {
                         Complex::new(i, q)
                     })
                     .collect();
-                Ok(samples)
+                samples
+            }
+            IqFormat::Sc16 => {
+                if data.len() % 4 != 0 {
+                    return Err("File size not a multiple of 4 bytes (2 × i16)".into());
+                }
+                let samples: Vec<Complex<f64>> = data
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        let i = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        let q = i16::from_le_bytes([chunk[2], chunk[3]]);
+                        Complex::new(i as f64 / 32768.0, q as f64 / 32768.0)
+                    })
+                    .collect();
+                samples
             }
             IqFormat::Csv => {
                 let text =
@@ -370,9 +408,64 @@ impl IqFileLoader {
                         .map_err(|e| format!("Line {}: invalid Q value: {e}", line_num + 1))?;
                     samples.push(Complex::new(i, q));
                 }
-                Ok(samples)
+                samples
+            }
+        };
+        
+        let arc_samples = std::sync::Arc::new(samples_vec);
+        *cache = Some(arc_samples.clone());
+        *last_path = Some(path.clone());
+        
+        Ok(arc_samples)
+    }
+
+    /// Clears the cached file so it is forced to reload.
+    pub fn clear_cache(&mut self) {
+        *self.last_path_loaded.lock().unwrap() = None;
+        *self.cached_samples.lock().unwrap() = None;
+    }
+
+    /// Generates exactly `num_samples` of IQ data simulating playback of the file at `out_sample_rate_mhz`.
+    pub fn generate_at_time(
+        &self,
+        num_samples: usize,
+        out_sample_rate_mhz: f64,
+        start_time_us: f64,
+    ) -> Result<Vec<Complex<f64>>, String> {
+        let file_samples = self.load()?;
+        let num_file_samples = file_samples.len();
+        
+        if num_file_samples == 0 {
+            return Ok(vec![Complex::new(0.0, 0.0); num_samples]);
+        }
+
+        let mut output = vec![Complex::new(0.0, 0.0); num_samples];
+        let file_fs_mhz = self.sample_rate_mhz.max(1e-6);
+        let file_duration_us = num_file_samples as f64 / file_fs_mhz;
+        let repeat_period_us = self.repeat_period_us.max(0.0);
+        let cycle_duration_us = file_duration_us + repeat_period_us;
+        
+        let out_dt_us = 1.0 / out_sample_rate_mhz;
+
+        for (i, sample) in output.iter_mut().enumerate() {
+            let t_out_us = start_time_us + i as f64 * out_dt_us;
+            
+            let t_rel_us = if self.repeat {
+                t_out_us % cycle_duration_us
+            } else {
+                t_out_us
+            };
+            
+            if t_rel_us < file_duration_us {
+                let idx_f = t_rel_us * file_fs_mhz;
+                let idx = idx_f.round() as usize; // Nearest-neighbor interpolation
+                if idx < num_file_samples {
+                    *sample = file_samples[idx];
+                }
             }
         }
+
+        Ok(output)
     }
 }
 
@@ -496,5 +589,68 @@ mod tests {
             let energy: f64 = samples.iter().map(|s| s.norm_sqr()).sum();
             assert!(energy > 0.0, "Modulated tone produced zero energy");
         }
+    }
+
+    #[test]
+    fn iq_file_loader_sc16_parsing() {
+        let dir = std::env::temp_dir();
+        let file_path = dir.join("test_sc16.iq");
+        
+        // Write exactly two complex samples (4 i16 values = 8 bytes)
+        // Sample 1: I=32767, Q=-32768
+        // Sample 2: I=0, Q=16384
+        let mut data = Vec::new();
+        data.extend_from_slice(&32767i16.to_le_bytes());
+        data.extend_from_slice(&(-32768i16).to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&16384i16.to_le_bytes());
+        std::fs::write(&file_path, &data).unwrap();
+
+        let mut loader = IqFileLoader::default();
+        loader.path = Some(file_path.clone());
+        loader.format = IqFormat::Sc16;
+
+        let samples = loader.load().unwrap();
+        assert_eq!(samples.len(), 2);
+        
+        assert!((samples[0].re - (32767.0 / 32768.0)).abs() < 1e-6);
+        assert!((samples[0].im - (-32768.0 / 32768.0)).abs() < 1e-6);
+        assert!((samples[1].re - 0.0).abs() < 1e-6);
+        assert!((samples[1].im - (16384.0 / 32768.0)).abs() < 1e-6);
+        
+        std::fs::remove_file(file_path).unwrap();
+    }
+
+    #[test]
+    fn iq_file_loader_generate_at_time_repeating() {
+        let dir = std::env::temp_dir();
+        let file_path = dir.join("test_repeat.csv");
+        
+        // 4 samples at 1 MHz = 4 us file duration
+        let csv_data = "1.0, 1.0\n2.0, 2.0\n3.0, 3.0\n4.0, 4.0\n";
+        std::fs::write(&file_path, csv_data).unwrap();
+
+        let mut loader = IqFileLoader::default();
+        loader.path = Some(file_path.clone());
+        loader.format = IqFormat::Csv;
+        loader.sample_rate_mhz = 1.0;
+        loader.repeat = true;
+        loader.repeat_period_us = 2.0; // 2 us idle gap
+
+        // File duration = 4 us. Idle gap = 2 us. Cycle = 6 us.
+        // We will read 10 samples at 1 MHz starting at 0 us.
+        let out_samples = loader.generate_at_time(10, 1.0, 0.0).unwrap();
+        
+        // 0..3: file samples
+        // 4..5: idle gap (0)
+        // 6..9: file samples (repeat)
+        assert_eq!(out_samples[0], Complex::new(1.0, 1.0));
+        assert_eq!(out_samples[3], Complex::new(4.0, 4.0));
+        assert_eq!(out_samples[4], Complex::new(0.0, 0.0)); // gap
+        assert_eq!(out_samples[5], Complex::new(0.0, 0.0)); // gap
+        assert_eq!(out_samples[6], Complex::new(1.0, 1.0)); // repeat starts
+        assert_eq!(out_samples[9], Complex::new(4.0, 4.0));
+
+        std::fs::remove_file(file_path).unwrap();
     }
 }

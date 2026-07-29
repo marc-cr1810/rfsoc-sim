@@ -181,8 +181,46 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                                     .pick_file()
                                 {
                                     src.file_loader.path = Some(path);
+                                    src.file_loader.clear_cache();
                                 }
                             }
+                            
+                            egui::Grid::new(format!("iq_file_grid_{:?}", node_id))
+                                .num_columns(2)
+                                .spacing([4.0, 3.0])
+                                .show(ui, |ui| {
+                                    ui.label("Format:");
+                                    egui::ComboBox::from_id_salt(format!("iq_format_{:?}", node_id))
+                                        .selected_text(src.file_loader.format.to_string())
+                                        .show_ui(ui, |ui| {
+                                            use crate::signal::IqFormat;
+                                            if ui.selectable_value(&mut src.file_loader.format, IqFormat::BinaryF32, "fc32 (Binary f32)").changed() { src.file_loader.clear_cache(); }
+                                            if ui.selectable_value(&mut src.file_loader.format, IqFormat::BinaryF64, "fc64 (Binary f64)").changed() { src.file_loader.clear_cache(); }
+                                            if ui.selectable_value(&mut src.file_loader.format, IqFormat::Sc16, "sc16 (Binary i16)").changed() { src.file_loader.clear_cache(); }
+                                            if ui.selectable_value(&mut src.file_loader.format, IqFormat::Csv, "CSV (I, Q)").changed() { src.file_loader.clear_cache(); }
+                                        });
+                                    ui.end_row();
+
+                                    ui.label("Capt. Rate:");
+                                    ui.add(egui::DragValue::new(&mut src.file_loader.sample_rate_mhz)
+                                        .suffix(" MHz")
+                                        .speed(1.0)
+                                        .range(0.001..=10000.0));
+                                    ui.end_row();
+
+                                    ui.label("Repeat:");
+                                    ui.checkbox(&mut src.file_loader.repeat, "");
+                                    ui.end_row();
+
+                                    if src.file_loader.repeat {
+                                        ui.label("Idle Gap:");
+                                        ui.add(egui::DragValue::new(&mut src.file_loader.repeat_period_us)
+                                            .suffix(" µs")
+                                            .speed(1.0)
+                                            .range(0.0..=1e6));
+                                        ui.end_row();
+                                    }
+                                });
                         }
                     }
                 }

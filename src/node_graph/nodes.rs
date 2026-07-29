@@ -305,7 +305,7 @@ fn evaluate_dsp_samples_recursively(
             SourceType::LocalGenerator => src.generator.generate_at_time(num_samples, sample_rate_mhz, time_us),
             SourceType::IqFile => src
                 .file_loader
-                .load()
+                .generate_at_time(num_samples, sample_rate_mhz, time_us)
                 .unwrap_or_else(|_| src.generator.generate_at_time(num_samples, sample_rate_mhz, time_us)),
         });
     }
