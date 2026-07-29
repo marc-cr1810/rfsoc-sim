@@ -10,8 +10,18 @@ use std::path::PathBuf;
 /// Dynamic modulation modes for tone components.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToneModulation {
-    /// Continuous wave (CW) with continuous phase.
+    /// Continuous wave (CW) with continuous phase. (Complex Exponential)
     Cw,
+    /// Real Cosine tone, energy at +f and -f
+    RealCosine,
+    /// Real Sine tone, energy at +f and -f (phase shifted)
+    RealSine,
+    /// Real Square wave
+    Square,
+    /// Real Sawtooth wave
+    Sawtooth,
+    /// Real Triangle wave
+    Triangle,
     /// Linear Frequency Modulated (LFM) Chirp / FMCW Sweep.
     SweptChirp { sweep_period_ms: f64 },
     /// Frequency Modulation (FM).
@@ -37,7 +47,12 @@ impl Default for ToneModulation {
 impl std::fmt::Display for ToneModulation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ToneModulation::Cw => write!(f, "CW (Tone)"),
+            ToneModulation::Cw => write!(f, "CW (Complex Tone)"),
+            ToneModulation::RealCosine => write!(f, "Cosine"),
+            ToneModulation::RealSine => write!(f, "Sine"),
+            ToneModulation::Square => write!(f, "Square"),
+            ToneModulation::Sawtooth => write!(f, "Sawtooth"),
+            ToneModulation::Triangle => write!(f, "Triangle"),
             ToneModulation::SweptChirp { .. } => write!(f, "FMCW Chirp Sweep"),
             ToneModulation::FmModulated { .. } => write!(f, "FM Modulated"),
             ToneModulation::PulsedRadar { .. } => write!(f, "Pulsed Radar"),
@@ -239,6 +254,54 @@ impl SignalGenerator {
                     for (i, sample) in samples.iter_mut().enumerate() {
                         let angle = phase_start + i as f64 * phase_step;
                         *sample += Complex::new(amp * angle.cos(), amp * angle.sin());
+                    }
+                }
+                ToneModulation::RealCosine => {
+                    let phase_start = 2.0 * PI * (tone.frequency_mhz * start_time_us).fract() + phase_rad;
+                    let phase_step = 2.0 * PI * tone.frequency_mhz * dt;
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let angle = phase_start + i as f64 * phase_step;
+                        *sample += Complex::new(amp * angle.cos(), 0.0);
+                    }
+                }
+                ToneModulation::RealSine => {
+                    let phase_start = 2.0 * PI * (tone.frequency_mhz * start_time_us).fract() + phase_rad;
+                    let phase_step = 2.0 * PI * tone.frequency_mhz * dt;
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let angle = phase_start + i as f64 * phase_step;
+                        *sample += Complex::new(amp * angle.sin(), 0.0);
+                    }
+                }
+                ToneModulation::Square => {
+                    let phase_start = 2.0 * PI * (tone.frequency_mhz * start_time_us).fract() + phase_rad;
+                    let phase_step = 2.0 * PI * tone.frequency_mhz * dt;
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let angle = (phase_start + i as f64 * phase_step) % (2.0 * PI);
+                        let val = if angle < PI { 1.0 } else { -1.0 };
+                        *sample += Complex::new(amp * val, 0.0);
+                    }
+                }
+                ToneModulation::Sawtooth => {
+                    let phase_start = 2.0 * PI * (tone.frequency_mhz * start_time_us).fract() + phase_rad;
+                    let phase_step = 2.0 * PI * tone.frequency_mhz * dt;
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let angle = (phase_start + i as f64 * phase_step) % (2.0 * PI);
+                        let val = (angle / PI) - 1.0;
+                        *sample += Complex::new(amp * val, 0.0);
+                    }
+                }
+                ToneModulation::Triangle => {
+                    let phase_start = 2.0 * PI * (tone.frequency_mhz * start_time_us).fract() + phase_rad;
+                    let phase_step = 2.0 * PI * tone.frequency_mhz * dt;
+
+                    for (i, sample) in samples.iter_mut().enumerate() {
+                        let angle = (phase_start + i as f64 * phase_step) % (2.0 * PI);
+                        let val = 2.0 * ((angle / PI) - 1.0).abs() - 1.0;
+                        *sample += Complex::new(amp * val, 0.0);
                     }
                 }
             }
@@ -652,5 +715,39 @@ mod tests {
         assert_eq!(out_samples[9], Complex::new(4.0, 4.0));
 
         std::fs::remove_file(file_path).unwrap();
+    }
+
+    #[test]
+    fn basic_real_waveforms_energy() {
+        let modes = vec![
+            ToneModulation::RealSine,
+            ToneModulation::RealCosine,
+            ToneModulation::Square,
+            ToneModulation::Sawtooth,
+            ToneModulation::Triangle,
+        ];
+
+        for mod_mode in modes {
+            let sig_generator = SignalGenerator {
+                tones: vec![Tone {
+                    frequency_mhz: 200.0,
+                    amplitude_dbfs: -3.0,
+                    phase_deg: 0.0,
+                    bandwidth_mhz: 0.0,
+                    modulation: mod_mode,
+                }],
+                noise_floor_dbfs: -100.0,
+                noise_enabled: false,
+            };
+
+            let samples = sig_generator.generate_at_time(512, 1000.0, 10.0);
+            
+            // Should be strictly real-valued
+            let real_energy: f64 = samples.iter().map(|s| s.re * s.re).sum();
+            let imag_energy: f64 = samples.iter().map(|s| s.im * s.im).sum();
+            
+            assert!(real_energy > 0.0, "Real waveform produced zero energy");
+            assert!(imag_energy < 1e-12, "Real waveform produced imaginary energy");
+        }
     }
 }

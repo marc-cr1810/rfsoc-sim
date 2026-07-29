@@ -339,24 +339,18 @@ impl eframe::App for RfSocSimApp {
                                 egui::ComboBox::from_id_salt(format!("tone_mod_{i}"))
                                     .selected_text(tone.modulation.to_string())
                                     .show_ui(ui, |ui| {
-                                        if ui.selectable_label(matches!(tone.modulation, crate::signal::ToneModulation::Cw), "CW (Tone)").clicked() {
-                                            tone.modulation = crate::signal::ToneModulation::Cw;
-                                        }
-                                        if ui.selectable_label(matches!(tone.modulation, crate::signal::ToneModulation::SweptChirp { .. }), "FMCW Chirp Sweep").clicked() {
-                                            tone.modulation = crate::signal::ToneModulation::SweptChirp { sweep_period_ms: 10.0 };
-                                        }
-                                        if ui.selectable_label(matches!(tone.modulation, crate::signal::ToneModulation::FmModulated { .. }), "FM Modulated").clicked() {
-                                            tone.modulation = crate::signal::ToneModulation::FmModulated { dev_mhz: 50.0, mod_freq_khz: 10.0 };
-                                        }
-                                        if ui.selectable_label(matches!(tone.modulation, crate::signal::ToneModulation::PulsedRadar { .. }), "Pulsed Radar").clicked() {
-                                            tone.modulation = crate::signal::ToneModulation::PulsedRadar { pulse_width_us: 20.0, pri_us: 100.0 };
-                                        }
-                                        if ui.selectable_label(matches!(tone.modulation, crate::signal::ToneModulation::FreqHopping { .. }), "Frequency Hopping").clicked() {
-                                            tone.modulation = crate::signal::ToneModulation::FreqHopping { hop_step_mhz: 50.0, num_channels: 8, hop_rate_hz: 500.0 };
-                                        }
-                                        if ui.selectable_label(matches!(tone.modulation, crate::signal::ToneModulation::DigitalQpsk { .. }), "Digital QPSK").clicked() {
-                                            tone.modulation = crate::signal::ToneModulation::DigitalQpsk { symbol_rate_ksps: 100.0 };
-                                        }
+                                        use crate::signal::ToneModulation::*;
+                                        if ui.selectable_label(matches!(tone.modulation, Cw), "CW (Complex Tone)").clicked() { tone.modulation = Cw; }
+                                        if ui.selectable_label(matches!(tone.modulation, RealCosine), "Cosine").clicked() { tone.modulation = RealCosine; }
+                                        if ui.selectable_label(matches!(tone.modulation, RealSine), "Sine").clicked() { tone.modulation = RealSine; }
+                                        if ui.selectable_label(matches!(tone.modulation, Square), "Square").clicked() { tone.modulation = Square; }
+                                        if ui.selectable_label(matches!(tone.modulation, Sawtooth), "Sawtooth").clicked() { tone.modulation = Sawtooth; }
+                                        if ui.selectable_label(matches!(tone.modulation, Triangle), "Triangle").clicked() { tone.modulation = Triangle; }
+                                        if ui.selectable_label(matches!(tone.modulation, SweptChirp { .. }), "FMCW Chirp Sweep").clicked() { tone.modulation = SweptChirp { sweep_period_ms: 10.0 }; }
+                                        if ui.selectable_label(matches!(tone.modulation, FmModulated { .. }), "FM Modulated").clicked() { tone.modulation = FmModulated { dev_mhz: 50.0, mod_freq_khz: 10.0 }; }
+                                        if ui.selectable_label(matches!(tone.modulation, PulsedRadar { .. }), "Pulsed Radar").clicked() { tone.modulation = PulsedRadar { pulse_width_us: 20.0, pri_us: 100.0 }; }
+                                        if ui.selectable_label(matches!(tone.modulation, FreqHopping { .. }), "Frequency Hopping").clicked() { tone.modulation = FreqHopping { hop_step_mhz: 50.0, num_channels: 8, hop_rate_hz: 500.0 }; }
+                                        if ui.selectable_label(matches!(tone.modulation, DigitalQpsk { .. }), "Digital QPSK").clicked() { tone.modulation = DigitalQpsk { symbol_rate_ksps: 100.0 }; }
                                     });
                             });
 
@@ -461,7 +455,12 @@ impl eframe::App for RfSocSimApp {
                                         );
                                     });
                                 }
-                                crate::signal::ToneModulation::Cw => {
+                                crate::signal::ToneModulation::Cw 
+                                | crate::signal::ToneModulation::RealCosine
+                                | crate::signal::ToneModulation::RealSine
+                                | crate::signal::ToneModulation::Square
+                                | crate::signal::ToneModulation::Sawtooth
+                                | crate::signal::ToneModulation::Triangle => {
                                     ui.horizontal(|ui| {
                                         ui.label("BW:");
                                         ui.add(

@@ -145,6 +145,26 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                                     .num_columns(2)
                                     .spacing([4.0, 3.0])
                                     .show(ui, |ui| {
+                                        ui.label("Type:");
+                                        let selected_text = tone.modulation.to_string();
+                                        egui::ComboBox::from_id_salt(format!("mod_combo_{:?}", node_id))
+                                            .selected_text(selected_text)
+                                            .show_ui(ui, |ui| {
+                                                use crate::signal::ToneModulation::*;
+                                                if ui.selectable_label(matches!(tone.modulation, Cw), "CW (Complex Tone)").clicked() { tone.modulation = Cw; }
+                                                if ui.selectable_label(matches!(tone.modulation, RealCosine), "Cosine").clicked() { tone.modulation = RealCosine; }
+                                                if ui.selectable_label(matches!(tone.modulation, RealSine), "Sine").clicked() { tone.modulation = RealSine; }
+                                                if ui.selectable_label(matches!(tone.modulation, Square), "Square").clicked() { tone.modulation = Square; }
+                                                if ui.selectable_label(matches!(tone.modulation, Sawtooth), "Sawtooth").clicked() { tone.modulation = Sawtooth; }
+                                                if ui.selectable_label(matches!(tone.modulation, Triangle), "Triangle").clicked() { tone.modulation = Triangle; }
+                                                if ui.selectable_label(matches!(tone.modulation, SweptChirp { .. }), "FMCW Chirp Sweep").clicked() { tone.modulation = SweptChirp { sweep_period_ms: 5.0 }; }
+                                                if ui.selectable_label(matches!(tone.modulation, FmModulated { .. }), "FM Modulated").clicked() { tone.modulation = FmModulated { dev_mhz: 10.0, mod_freq_khz: 10.0 }; }
+                                                if ui.selectable_label(matches!(tone.modulation, PulsedRadar { .. }), "Pulsed Radar").clicked() { tone.modulation = PulsedRadar { pulse_width_us: 10.0, pri_us: 100.0 }; }
+                                                if ui.selectable_label(matches!(tone.modulation, FreqHopping { .. }), "Frequency Hopping").clicked() { tone.modulation = FreqHopping { hop_step_mhz: 10.0, num_channels: 10, hop_rate_hz: 100.0 }; }
+                                                if ui.selectable_label(matches!(tone.modulation, DigitalQpsk { .. }), "Digital QPSK").clicked() { tone.modulation = DigitalQpsk { symbol_rate_ksps: 100.0 }; }
+                                            });
+                                        ui.end_row();
+
                                         ui.label("Freq:");
                                         ui.add(egui::DragValue::new(&mut tone.frequency_mhz)
                                             .range(0.1..=10000.0)
@@ -165,6 +185,56 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                                             .suffix(" dBFS")
                                             .speed(1.0));
                                         ui.end_row();
+                                        
+                                        use crate::signal::ToneModulation::*;
+                                        match &mut tone.modulation {
+                                            Cw | RealCosine | RealSine | Square | Sawtooth | Triangle => {}
+                                            SweptChirp { sweep_period_ms } => {
+                                                ui.label("Sweep BW:");
+                                                ui.add(egui::DragValue::new(&mut tone.bandwidth_mhz).suffix(" MHz").speed(1.0));
+                                                ui.end_row();
+                                                
+                                                ui.label("Period:");
+                                                ui.add(egui::DragValue::new(sweep_period_ms).suffix(" ms").speed(0.1));
+                                                ui.end_row();
+                                            }
+                                            FmModulated { dev_mhz, mod_freq_khz } => {
+                                                ui.label("Dev:");
+                                                ui.add(egui::DragValue::new(dev_mhz).suffix(" MHz").speed(1.0));
+                                                ui.end_row();
+                                                
+                                                ui.label("Mod Freq:");
+                                                ui.add(egui::DragValue::new(mod_freq_khz).suffix(" kHz").speed(1.0));
+                                                ui.end_row();
+                                            }
+                                            PulsedRadar { pulse_width_us, pri_us } => {
+                                                ui.label("Width:");
+                                                ui.add(egui::DragValue::new(pulse_width_us).suffix(" µs").speed(1.0));
+                                                ui.end_row();
+                                                
+                                                ui.label("PRI:");
+                                                ui.add(egui::DragValue::new(pri_us).suffix(" µs").speed(1.0));
+                                                ui.end_row();
+                                            }
+                                            FreqHopping { hop_step_mhz, num_channels, hop_rate_hz } => {
+                                                ui.label("Step:");
+                                                ui.add(egui::DragValue::new(hop_step_mhz).suffix(" MHz").speed(1.0));
+                                                ui.end_row();
+                                                
+                                                ui.label("Chans:");
+                                                ui.add(egui::DragValue::new(num_channels));
+                                                ui.end_row();
+                                                
+                                                ui.label("Rate:");
+                                                ui.add(egui::DragValue::new(hop_rate_hz).suffix(" Hz").speed(1.0));
+                                                ui.end_row();
+                                            }
+                                            DigitalQpsk { symbol_rate_ksps } => {
+                                                ui.label("Sym Rate:");
+                                                ui.add(egui::DragValue::new(symbol_rate_ksps).suffix(" ksps").speed(10.0));
+                                                ui.end_row();
+                                            }
+                                        }
                                     });
                             }
                         }
