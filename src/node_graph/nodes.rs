@@ -22,6 +22,7 @@ pub enum RfNode {
     Amplifier(AmplifierNode),
     Attenuator(AttenuatorNode),
     Splitter(SplitterNode),
+    S2p(S2pNode),
     AdcInput(AdcInputNode),
 }
 
@@ -39,6 +40,7 @@ impl RfNode {
             RfNode::Amplifier(_) => "Amplifier",
             RfNode::Attenuator(_) => "Attenuator",
             RfNode::Splitter(_) => "Splitter",
+            RfNode::S2p(s) => &s.model.name,
             RfNode::AdcInput(_) => "ADC Input",
         }
     }
@@ -72,6 +74,7 @@ impl RfNode {
             RfNode::Amplifier(a) => a.model.apply(&mut output),
             RfNode::Attenuator(a) => a.model.apply(&mut output),
             RfNode::Splitter(s) => s.model.apply(&mut output),
+            RfNode::S2p(s) => s.model.apply(&mut output),
             RfNode::AdcInput(_) => {} // Sink node, no processing
         }
         output
@@ -172,6 +175,19 @@ impl Default for SplitterNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S2pNode {
+    pub model: S2pModel,
+}
+
+impl Default for S2pNode {
+    fn default() -> Self {
+        Self {
+            model: S2pModel::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdcInputNode {
     /// Which ADC tile this input feeds (0–3).
     pub tile_index: usize,
@@ -194,11 +210,15 @@ impl Default for AdcInputNode {
 
 use num_complex::Complex;
 
-/// Evaluation result containing generated samples and cumulative RF chain frequency response.
+/// Evaluation result containing generated samples, cumulative RF chain frequency response,
+/// and dynamic cascaded RF metrics (Gain, Noise Figure, OIP3).
 pub struct GraphEvaluationResult {
     pub samples: Vec<Complex<f64>>,
     pub rf_chain_response_db: Vec<f64>,
     pub rf_chain_freq_axis_mhz: Vec<f64>,
+    pub cascaded_gain_db: f64,
+    pub cascaded_nf_db: f64,
+    pub cascaded_oip3_dbm: f64,
 }
 
 /// Traverses the Snarl node graph backwards from an `AdcInput(target_tile, target_block)` node,
@@ -279,6 +299,7 @@ pub fn evaluate_graph(
             RfNode::Amplifier(a) => a.model.process_samples(&current_samples),
             RfNode::Attenuator(a) => a.model.process_samples(&current_samples),
             RfNode::Splitter(s) => s.model.process_samples(&current_samples),
+            RfNode::S2p(s) => s.model.process_samples(&current_samples, sample_rate_mhz),
             RfNode::SignalSource(_) | RfNode::AdcInput(_) => current_samples,
         };
     }
@@ -301,15 +322,70 @@ pub fn evaluate_graph(
                 RfNode::Amplifier(a) => rf_chain_response_db[bin] += a.model.gain_db,
                 RfNode::Attenuator(a) => rf_chain_response_db[bin] -= a.model.attenuation_db,
                 RfNode::Splitter(s) => rf_chain_response_db[bin] -= s.model.total_loss_db(),
+                RfNode::S2p(s) => rf_chain_response_db[bin] += s.model.s21_gain_at(freq),
                 RfNode::SignalSource(_) | RfNode::AdcInput(_) => {}
             }
         }
     }
 
+    // Calculate dynamic Cascaded Gain, Friis Noise Figure, and OIP3
+    let mut cum_gain_lin = 1.0_f64;
+    let mut cum_noise_factor = 1.0_f64;
+    let mut inv_cum_oip3_lin = 0.0_f64;
+
+    for &node_id in &node_chain {
+        let node = &snarl[node_id];
+        let (stage_gain_db, stage_nf_db, stage_oip3_dbm) = match node {
+            RfNode::Balun(b) => {
+                let loss = b.model.insertion_loss_at(1000.0);
+                (-loss, loss, 100.0) // Ideal passive
+            }
+            RfNode::Filter(f) => {
+                let loss = f.model.attenuation_at(1000.0);
+                (-loss, loss, 100.0)
+            }
+            RfNode::Amplifier(a) => (a.model.gain_db, a.model.noise_figure_db, a.model.p1db_dbm + 10.0),
+            RfNode::Attenuator(a) => (-a.model.attenuation_db, a.model.attenuation_db, 10.0),
+            RfNode::Splitter(s) => {
+                let loss = s.model.total_loss_db();
+                (-loss, loss, 100.0)
+            }
+            RfNode::S2p(s) => (s.model.s21_gain_at(1000.0), s.model.noise_figure_db, s.model.oip3_dbm),
+            RfNode::SignalSource(_) | RfNode::AdcInput(_) => (0.0, 0.0, 100.0),
+        };
+
+        let g_stage = 10.0_f64.powf(stage_gain_db / 10.0);
+        let f_stage = 10.0_f64.powf(stage_nf_db / 10.0);
+        let oip3_stage = 10.0_f64.powf(stage_oip3_dbm / 10.0);
+
+        if cum_gain_lin == 1.0 && cum_noise_factor == 1.0 {
+            cum_noise_factor = f_stage;
+        } else {
+            cum_noise_factor += (f_stage - 1.0) / cum_gain_lin;
+        }
+
+        if oip3_stage < 1e9 {
+            inv_cum_oip3_lin += 1.0 / (g_stage * oip3_stage);
+        }
+
+        cum_gain_lin *= g_stage;
+    }
+
+    let cascaded_gain_db = 10.0 * cum_gain_lin.max(1e-12).log10();
+    let cascaded_nf_db = 10.0 * cum_noise_factor.max(1.0).log10();
+    let cascaded_oip3_dbm = if inv_cum_oip3_lin > 1e-12 {
+        10.0 * (1.0 / inv_cum_oip3_lin).log10()
+    } else {
+        100.0
+    };
+
     Some(GraphEvaluationResult {
         samples: current_samples,
         rf_chain_response_db,
         rf_chain_freq_axis_mhz,
+        cascaded_gain_db,
+        cascaded_nf_db,
+        cascaded_oip3_dbm,
     })
 }
 
@@ -359,5 +435,57 @@ mod tests {
         let res = evaluate_graph(&snarl, 0, 0, 1024, 10000.0, &global_gen);
         assert!(res.is_some());
         assert_eq!(res.unwrap().samples.len(), 1024);
+    }
+
+    #[test]
+    fn friis_cascaded_noise_figure() {
+        let mut snarl = Snarl::<RfNode>::new();
+        let src_id = snarl.insert_node(
+            egui::pos2(0.0, 0.0),
+            RfNode::SignalSource(SignalSourceNode::default()),
+        );
+
+        // Stage 1 LNA: Gain = 20 dB, NF = 2 dB
+        let mut amp1 = AmplifierNode::default();
+        amp1.model.gain_db = 20.0;
+        amp1.model.noise_figure_db = 2.0;
+        let amp1_id = snarl.insert_node(egui::pos2(100.0, 0.0), RfNode::Amplifier(amp1));
+
+        // Stage 2 Amp: Gain = 10 dB, NF = 8 dB
+        let mut amp2 = AmplifierNode::default();
+        amp2.model.gain_db = 10.0;
+        amp2.model.noise_figure_db = 8.0;
+        let amp2_id = snarl.insert_node(egui::pos2(200.0, 0.0), RfNode::Amplifier(amp2));
+
+        let adc_id = snarl.insert_node(
+            egui::pos2(300.0, 0.0),
+            RfNode::AdcInput(AdcInputNode {
+                tile_index: 0,
+                block_index: 0,
+            }),
+        );
+
+        snarl.connect(
+            egui_snarl::OutPinId { node: src_id, output: 0 },
+            egui_snarl::InPinId { node: amp1_id, input: 0 },
+        );
+        snarl.connect(
+            egui_snarl::OutPinId { node: amp1_id, output: 0 },
+            egui_snarl::InPinId { node: amp2_id, input: 0 },
+        );
+        snarl.connect(
+            egui_snarl::OutPinId { node: amp2_id, output: 0 },
+            egui_snarl::InPinId { node: adc_id, input: 0 },
+        );
+
+        let global_gen = crate::signal::SignalGenerator::default();
+        let res = evaluate_graph(&snarl, 0, 0, 1024, 10000.0, &global_gen).unwrap();
+
+        // Total Gain = 30 dB
+        assert!((res.cascaded_gain_db - 30.0).abs() < 1e-3);
+        // Friis formula: F_total = F1 + (F2 - 1) / G1
+        // F1 = 10^(2/10) = 1.5849, F2 = 10^(8/10) = 6.3095, G1 = 100
+        // F_total = 1.5849 + 5.3095 / 100 = 1.6380 -> NF = 10 log10(1.6380) = 2.143 dB
+        assert!((res.cascaded_nf_db - 2.143).abs() < 0.05);
     }
 }

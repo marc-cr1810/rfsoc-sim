@@ -223,6 +223,23 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                     ui.label(format!("{}-way split", spl.model.num_outputs));
                     ui.label(format!("Loss: {:.1} dB", spl.model.total_loss_db()));
                 }
+                RfNode::S2p(s2p) => {
+                    ui.label(egui::RichText::new(&s2p.model.name).small().strong());
+                    ui.label(format!("Pts: {}", s2p.model.s21_table.len()));
+                    if ui.button("📂 Load .s2p").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Touchstone S2P", &["s2p"])
+                            .pick_file()
+                        {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("S2P Block");
+                                if let Ok(parsed) = super::components::parse_touchstone_s2p(name, &content) {
+                                    s2p.model = parsed;
+                                }
+                            }
+                        }
+                    }
+                }
                 RfNode::AdcInput(adc) => {
                     egui::Grid::new(format!("adc_grid_{:?}", node_id))
                         .num_columns(2)
@@ -291,6 +308,10 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
         }
         if ui.button("🔀 Splitter").clicked() {
             snarl.insert_node(pos, RfNode::Splitter(SplitterNode::default()));
+            ui.close();
+        }
+        if ui.button("📄 Touchstone .s2p Block").clicked() {
+            snarl.insert_node(pos, RfNode::S2p(S2pNode::default()));
             ui.close();
         }
         ui.separator();

@@ -166,6 +166,59 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
     });
 
     ui.separator();
+    ui.collapsing("🔬 ADC Hardware Non-Idealities", |ui| {
+        let non = &mut block.non_idealities;
+        ui.checkbox(&mut non.enabled, "Enable Hardware Distortion");
+        if non.enabled {
+            ui.horizontal(|ui| {
+                ui.label("ENOB:");
+                ui.add(
+                    egui::DragValue::new(&mut non.enob)
+                        .range(4.0..=16.0)
+                        .speed(0.1)
+                        .suffix(" bits"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Quantization:");
+                ui.add(
+                    egui::DragValue::new(&mut non.quantization_bits)
+                        .range(4..=16)
+                        .speed(1)
+                        .suffix(" bits"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("HD2:");
+                ui.add(
+                    egui::DragValue::new(&mut non.hd2_dbc)
+                        .range(-150.0..=0.0)
+                        .speed(1.0)
+                        .suffix(" dBc"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("HD3:");
+                ui.add(
+                    egui::DragValue::new(&mut non.hd3_dbc)
+                        .range(-150.0..=0.0)
+                        .speed(1.0)
+                        .suffix(" dBc"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("IL Spur:");
+                ui.add(
+                    egui::DragValue::new(&mut non.interleaving_spur_dbc)
+                        .range(-150.0..=0.0)
+                        .speed(1.0)
+                        .suffix(" dBc"),
+                );
+            });
+        }
+    });
+
+    ui.separator();
     ui.collapsing("⚡ Auto-Tune & SDR Nyquist Planner", |ui| {
         ui.label(
             egui::RichText::new("Center-tune target RF frequency to 0 Hz complex baseband:")

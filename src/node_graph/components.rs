@@ -371,6 +371,149 @@ impl SplitterModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Touchstone .s2p S-Parameter Component Model
+// ---------------------------------------------------------------------------
+
+/// Touchstone 2-port S-parameter component model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S2pModel {
+    pub name: String,
+    /// S21 lookup table: (frequency_mhz, gain_db).
+    pub s21_table: Vec<(f64, f64)>,
+    /// Noise Figure in dB.
+    pub noise_figure_db: f64,
+    /// OIP3 in dBm.
+    pub oip3_dbm: f64,
+}
+
+impl Default for S2pModel {
+    fn default() -> Self {
+        Self {
+            name: "Generic S2P Block".to_string(),
+            s21_table: vec![
+                (10.0, -0.5),
+                (500.0, -0.8),
+                (1000.0, -1.2),
+                (2000.0, -2.0),
+                (4000.0, -3.5),
+                (6000.0, -6.0),
+            ],
+            noise_figure_db: 1.5,
+            oip3_dbm: 35.0,
+        }
+    }
+}
+
+impl S2pModel {
+    pub fn s21_gain_at(&self, freq_mhz: f64) -> f64 {
+        if self.s21_table.is_empty() {
+            return 0.0;
+        }
+        if freq_mhz <= self.s21_table[0].0 {
+            return self.s21_table[0].1;
+        }
+        if freq_mhz >= self.s21_table.last().unwrap().0 {
+            return self.s21_table.last().unwrap().1;
+        }
+
+        for window in self.s21_table.windows(2) {
+            let (f0, g0) = window[0];
+            let (f1, g1) = window[1];
+            if freq_mhz >= f0 && freq_mhz <= f1 {
+                let t = (freq_mhz - f0) / (f1 - f0);
+                return g0 + t * (g1 - g0);
+            }
+        }
+        self.s21_table.last().unwrap().1
+    }
+
+    pub fn apply(&self, spectrum: &mut Spectrum) {
+        for (mag, freq) in spectrum
+            .magnitude_dbfs
+            .iter_mut()
+            .zip(spectrum.freq_axis_mhz.iter())
+        {
+            let gain = self.s21_gain_at(freq.abs());
+            *mag += gain;
+        }
+    }
+
+    pub fn process_samples(&self, samples: &[Complex<f64>], sample_rate_mhz: f64) -> Vec<Complex<f64>> {
+        apply_frequency_response(samples, sample_rate_mhz, |freq| {
+            let gain_db = self.s21_gain_at(freq);
+            10.0_f64.powf(gain_db / 20.0)
+        })
+    }
+}
+
+/// Parse a Touchstone .s2p file content into an `S2pModel`.
+pub fn parse_touchstone_s2p(name: &str, content: &str) -> Result<S2pModel, String> {
+    let mut freq_multiplier = 1.0;
+    let mut is_db = true;
+    let mut is_ri = false;
+    let mut s21_table = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('!') {
+            continue;
+        }
+
+        if line.starts_with('#') {
+            let tokens: Vec<&str> = line[1..].split_whitespace().collect();
+            for token in tokens {
+                let tok_upper = token.to_uppercase();
+                match tok_upper.as_str() {
+                    "HZ" => freq_multiplier = 1e-6,
+                    "KHZ" => freq_multiplier = 1e-3,
+                    "MHZ" => freq_multiplier = 1.0,
+                    "GHZ" => freq_multiplier = 1000.0,
+                    "DB" => is_db = true,
+                    "MA" => is_db = false,
+                    "RI" => {
+                        is_db = false;
+                        is_ri = true;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 9 {
+            let freq = parts[0].parse::<f64>().map_err(|e| format!("Invalid freq: {e}"))? * freq_multiplier;
+            let v1 = parts[3].parse::<f64>().map_err(|e| format!("Invalid S21 v1: {e}"))?;
+            let v2 = parts[4].parse::<f64>().map_err(|e| format!("Invalid S21 v2: {e}"))?;
+
+            let s21_db = if is_db {
+                v1
+            } else if is_ri {
+                let mag = (v1 * v1 + v2 * v2).sqrt();
+                20.0 * mag.max(1e-12).log10()
+            } else {
+                20.0 * v1.max(1e-12).log10()
+            };
+
+            s21_table.push((freq, s21_db));
+        }
+    }
+
+    if s21_table.is_empty() {
+        return Err("No valid S2P data points found".into());
+    }
+
+    s21_table.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    Ok(S2pModel {
+        name: name.to_string(),
+        s21_table,
+        noise_figure_db: 2.0,
+        oip3_dbm: 30.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +564,16 @@ mod tests {
         };
         // Ideal 2-way split = 3.01 dB
         assert!((splitter.total_loss_db() - 3.01).abs() < 0.1);
+    }
+
+    #[test]
+    fn touchstone_s2p_parsing() {
+        let sample_s2p = "! Sample Touchstone File\n# MHz S DB R 50\n100.0 -15.0 0.0 -0.5 0.0 -15.0 0.0 -15.0 0.0\n1000.0 -20.0 0.0 -2.5 0.0 -20.0 0.0 -20.0 0.0\n";
+        let model = parse_touchstone_s2p("Test Filter", sample_s2p).unwrap();
+        assert_eq!(model.name, "Test Filter");
+        assert_eq!(model.s21_table.len(), 2);
+        assert!((model.s21_gain_at(100.0) - (-0.5)).abs() < 1e-5);
+        assert!((model.s21_gain_at(1000.0) - (-2.5)).abs() < 1e-5);
+        assert!((model.s21_gain_at(550.0) - (-1.5)).abs() < 1e-5);
     }
 }

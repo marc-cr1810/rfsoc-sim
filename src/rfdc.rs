@@ -142,6 +142,30 @@ pub struct AutoTuneResult {
     pub nco_freq_mhz: f64,
 }
 
+/// ADC Non-idealities configuration for hardware-level distortion simulation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdcNonIdealities {
+    pub enabled: bool,
+    pub enob: f64,
+    pub quantization_bits: u8,
+    pub hd2_dbc: f64,
+    pub hd3_dbc: f64,
+    pub interleaving_spur_dbc: f64,
+}
+
+impl Default for AdcNonIdealities {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            enob: 11.5,
+            quantization_bits: 12,
+            hd2_dbc: -70.0,
+            hd3_dbc: -75.0,
+            interleaving_spur_dbc: -68.0,
+        }
+    }
+}
+
 /// A single ADC converter block with its DDC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdcBlock {
@@ -151,6 +175,7 @@ pub struct AdcBlock {
     pub nco_freq_mhz: f64,
     pub decimation: DecimationFactor,
     pub calibration_mode: CalibrationMode,
+    pub non_idealities: AdcNonIdealities,
 }
 
 impl AdcBlock {
@@ -162,6 +187,7 @@ impl AdcBlock {
             nco_freq_mhz: 0.0,
             decimation: DecimationFactor::X1,
             calibration_mode: CalibrationMode::Mode1,
+            non_idealities: AdcNonIdealities::default(),
         }
     }
 

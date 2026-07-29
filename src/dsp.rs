@@ -38,6 +38,153 @@ pub struct ProcessedSignal {
 
 // ...
 
+use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+
+thread_local! {
+    static FFT_PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::new());
+}
+
+/// FFT window functions for spectral analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FftWindow {
+    Hanning,
+    Hamming,
+    BlackmanHarris,
+    FlatTop,
+    Rectangular,
+}
+
+impl FftWindow {
+    pub const ALL: [FftWindow; 5] = [
+        FftWindow::Hanning,
+        FftWindow::Hamming,
+        FftWindow::BlackmanHarris,
+        FftWindow::FlatTop,
+        FftWindow::Rectangular,
+    ];
+
+    pub fn apply(&self, buffer: &mut [Complex<f64>]) {
+        let n = buffer.len();
+        if n == 0 {
+            return;
+        }
+        match self {
+            FftWindow::Hanning => {
+                for (i, sample) in buffer.iter_mut().enumerate() {
+                    let w = 0.5 * (1.0 - (2.0 * PI * i as f64 / n as f64).cos());
+                    *sample *= w;
+                }
+            }
+            FftWindow::Hamming => {
+                for (i, sample) in buffer.iter_mut().enumerate() {
+                    let w = 0.54 - 0.46 * (2.0 * PI * i as f64 / n as f64).cos();
+                    *sample *= w;
+                }
+            }
+            FftWindow::BlackmanHarris => {
+                for (i, sample) in buffer.iter_mut().enumerate() {
+                    let a0 = 0.35875;
+                    let a1 = 0.48829;
+                    let a2 = 0.14128;
+                    let a3 = 0.01168;
+                    let phi = 2.0 * PI * i as f64 / n as f64;
+                    let w = a0 - a1 * phi.cos() + a2 * (2.0 * phi).cos() - a3 * (3.0 * phi).cos();
+                    *sample *= w;
+                }
+            }
+            FftWindow::FlatTop => {
+                for (i, sample) in buffer.iter_mut().enumerate() {
+                    let a0 = 0.21557895;
+                    let a1 = 0.41663158;
+                    let a2 = 0.277263158;
+                    let a3 = 0.083578947;
+                    let a4 = 0.006947368;
+                    let phi = 2.0 * PI * i as f64 / n as f64;
+                    let w = a0 - a1 * phi.cos() + a2 * (2.0 * phi).cos() - a3 * (3.0 * phi).cos() + a4 * (4.0 * phi).cos();
+                    *sample *= w;
+                }
+            }
+            FftWindow::Rectangular => {}
+        }
+    }
+}
+
+impl std::fmt::Display for FftWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FftWindow::Hanning => write!(f, "Hanning"),
+            FftWindow::Hamming => write!(f, "Hamming"),
+            FftWindow::BlackmanHarris => write!(f, "Blackman-Harris"),
+            FftWindow::FlatTop => write!(f, "Flat-Top"),
+            FftWindow::Rectangular => write!(f, "Rectangular"),
+        }
+    }
+}
+
+/// Apply ADC hardware non-idealities (HD2/HD3 distortion, bit quantization, interleaving spurs).
+pub fn apply_adc_non_idealities(
+    samples: &[Complex<f64>],
+    non_idealities: &crate::rfdc::AdcNonIdealities,
+) -> Vec<Complex<f64>> {
+    if !non_idealities.enabled || samples.is_empty() {
+        return samples.to_vec();
+    }
+
+    let a2 = if non_idealities.hd2_dbc < 0.0 {
+        10.0_f64.powf(non_idealities.hd2_dbc / 20.0)
+    } else {
+        0.0
+    };
+    let a3 = if non_idealities.hd3_dbc < 0.0 {
+        10.0_f64.powf(non_idealities.hd3_dbc / 20.0)
+    } else {
+        0.0
+    };
+    let spur_amp = if non_idealities.interleaving_spur_dbc < 0.0 {
+        10.0_f64.powf(non_idealities.interleaving_spur_dbc / 20.0)
+    } else {
+        0.0
+    };
+
+    let q_levels = if non_idealities.quantization_bits > 0 && non_idealities.quantization_bits <= 24 {
+        (1u64 << non_idealities.quantization_bits) as f64
+    } else {
+        0.0
+    };
+
+    samples
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let mut val = s;
+            // 1. Non-linear distortion (HD2, HD3)
+            if a2 > 0.0 {
+                let mag_sq = s.norm_sqr();
+                val += s * (a2 * mag_sq.sqrt());
+            }
+            if a3 > 0.0 {
+                val += s * (a3 * s.norm_sqr());
+            }
+
+            // 2. Interleaving mismatch spur (at Fs/8 boundary)
+            if spur_amp > 0.0 {
+                let phase = PI / 4.0 * i as f64;
+                val += Complex::new(spur_amp * phase.cos(), spur_amp * phase.sin());
+            }
+
+            // 3. Bit resolution quantization
+            if q_levels > 0.0 {
+                let re = (val.re * q_levels / 2.0).round() / (q_levels / 2.0);
+                let im = (val.im * q_levels / 2.0).round() / (q_levels / 2.0);
+                val = Complex::new(re, im);
+            }
+
+            val
+        })
+        .collect()
+}
+
 /// Process a signal through the full ADC block pipeline.
 ///
 /// Pipeline: input → fold spectrum → mix → decimate → output spectrum
@@ -52,9 +199,12 @@ pub fn process_adc_block(
     let fft_size = 2048;
     let fs_mhz = tile.sample_rate_mhz();
 
+    // Apply ADC non-idealities to input samples
+    let adc_samples = apply_adc_non_idealities(input_samples, &block.non_idealities);
+
     // 1. Input spectrum (full wideband)
     let (input_spectrum, input_freq) =
-        compute_spectrum_positive(input_samples, fft_size, input_sample_rate_mhz);
+        compute_spectrum_positive(&adc_samples, fft_size, input_sample_rate_mhz);
 
     let raw_source_spectrum_dbfs = raw_source_samples.map(|samples| {
         let (raw_spec, _) = compute_spectrum_positive(samples, fft_size, input_sample_rate_mhz);
@@ -66,7 +216,7 @@ pub fn process_adc_block(
         fold_spectrum(&input_spectrum, &input_freq, fs_mhz);
 
     // 3. Apply mixer to input time-domain samples at the input sample rate
-    let mixed_samples = apply_mixer(input_samples, block.mixer_mode, block.nco_freq_mhz, input_sample_rate_mhz);
+    let mixed_samples = apply_mixer(&adc_samples, block.mixer_mode, block.nco_freq_mhz, input_sample_rate_mhz);
 
     // 4. Compute post-mixer spectrum
     let (post_mixer_spectrum, post_mixer_freq) = if block.mixer_active() {
@@ -109,13 +259,12 @@ pub fn process_adc_block(
     }
 }
 
-/// Compute the power spectrum of complex samples using FFT.
-///
-/// Returns (magnitude_dbfs, freq_axis_mhz) where frequencies are centred around 0.
-pub fn compute_spectrum(
+/// Compute the power spectrum of complex samples using FFT with a specific window function.
+pub fn compute_spectrum_with_window(
     samples: &[Complex<f64>],
     fft_size: usize,
     sample_rate_mhz: f64,
+    window: FftWindow,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = (fft_size.min(samples.len()) / 2) * 2;
     if n == 0 {
@@ -123,15 +272,14 @@ pub fn compute_spectrum(
     }
     let mut buffer: Vec<Complex<f64>> = samples[..n].to_vec();
 
-    // Apply Hanning window
-    for (i, sample) in buffer.iter_mut().enumerate() {
-        let w = 0.5 * (1.0 - (2.0 * PI * i as f64 / n as f64).cos());
-        *sample *= w;
-    }
+    // Apply selected window function
+    window.apply(&mut buffer);
 
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(n);
-    fft.process(&mut buffer);
+    // Process FFT using thread-local planner cache
+    FFT_PLANNER.with(|planner| {
+        let fft = planner.borrow_mut().plan_fft_forward(n);
+        fft.process(&mut buffer);
+    });
 
     // Compute magnitude in dBFS (normalised to FFT size)
     let norm = 1.0 / n as f64;
@@ -157,11 +305,21 @@ pub fn compute_spectrum(
     (shifted, freq_axis)
 }
 
-/// Compute single-sided (positive frequency only) power spectrum.
-pub fn compute_spectrum_positive(
+/// Compute the power spectrum of complex samples using FFT (default Hanning window).
+pub fn compute_spectrum(
     samples: &[Complex<f64>],
     fft_size: usize,
     sample_rate_mhz: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    compute_spectrum_with_window(samples, fft_size, sample_rate_mhz, FftWindow::Hanning)
+}
+
+/// Compute single-sided (positive frequency only) power spectrum with a specific window function.
+pub fn compute_spectrum_positive_with_window(
+    samples: &[Complex<f64>],
+    fft_size: usize,
+    sample_rate_mhz: f64,
+    window: FftWindow,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = (fft_size.min(samples.len()) / 2) * 2;
     if n == 0 {
@@ -169,15 +327,13 @@ pub fn compute_spectrum_positive(
     }
     let mut buffer: Vec<Complex<f64>> = samples[..n].to_vec();
 
-    // Apply Hanning window
-    for (i, sample) in buffer.iter_mut().enumerate() {
-        let w = 0.5 * (1.0 - (2.0 * PI * i as f64 / n as f64).cos());
-        *sample *= w;
-    }
+    // Apply selected window function
+    window.apply(&mut buffer);
 
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(n);
-    fft.process(&mut buffer);
+    FFT_PLANNER.with(|planner| {
+        let fft = planner.borrow_mut().plan_fft_forward(n);
+        fft.process(&mut buffer);
+    });
 
     let norm = 1.0 / n as f64;
     let half = n / 2;
@@ -196,6 +352,15 @@ pub fn compute_spectrum_positive(
         .collect();
 
     (spectrum_dbfs, freq_axis)
+}
+
+/// Compute single-sided (positive frequency only) power spectrum (default Hanning window).
+pub fn compute_spectrum_positive(
+    samples: &[Complex<f64>],
+    fft_size: usize,
+    sample_rate_mhz: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    compute_spectrum_positive_with_window(samples, fft_size, sample_rate_mhz, FftWindow::Hanning)
 }
 
 /// Fold a wideband spectrum into a single Nyquist zone, simulating ADC sampling/aliasing.
@@ -323,24 +488,56 @@ pub fn apply_mixer(
     }
 }
 
-/// Apply decimation (simple model: average + downsample).
+/// Apply decimation using anti-aliasing FIR windowed-sinc filtering before downsampling.
 ///
-/// In real hardware this is a multi-stage CIC+FIR filter chain.
-/// We approximate it with a moving-average lowpass + downsample.
+/// Simulates multi-stage halfband/CIC decimation filters in Xilinx DDC IP blocks.
 pub fn apply_decimation(samples: &[Complex<f64>], factor: u32) -> Vec<Complex<f64>> {
-    if factor <= 1 {
+    if factor <= 1 || samples.is_empty() {
         return samples.to_vec();
     }
 
     let f = factor as usize;
+    let cutoff = 0.45 / f as f64; // Normalized cutoff frequency
+    let num_taps = (16 * f).min(64) | 1; // Odd tap count
+    let half_taps = num_taps / 2;
+
+    // Design a windowed Sinc low-pass FIR filter
+    let mut fir = vec![0.0; num_taps];
+    let mut sum = 0.0;
+    for i in 0..num_taps {
+        let n = i as f64 - half_taps as f64;
+        let h = if n == 0.0 {
+            2.0 * cutoff
+        } else {
+            (2.0 * PI * cutoff * n).sin() / (PI * n)
+        };
+        // Blackman window for high stopband attenuation
+        let w = 0.42 - 0.5 * (2.0 * PI * i as f64 / (num_taps - 1) as f64).cos()
+            + 0.08 * (4.0 * PI * i as f64 / (num_taps - 1) as f64).cos();
+        fir[i] = h * w;
+        sum += fir[i];
+    }
+    // Normalize gain to 0 dB in passband
+    if sum > 0.0 {
+        for tap in &mut fir {
+            *tap /= sum;
+        }
+    }
+
+    // Apply FIR filter then downsample
     let output_len = samples.len() / f;
     let mut output = Vec::with_capacity(output_len);
 
-    for i in 0..output_len {
-        let start = i * f;
-        let end = (start + f).min(samples.len());
-        let sum: Complex<f64> = samples[start..end].iter().sum();
-        output.push(sum / f as f64);
+    for idx in 0..output_len {
+        let center = idx * f;
+        let mut filtered = Complex::new(0.0, 0.0);
+        for (tap_idx, &coeff) in fir.iter().enumerate() {
+            let sample_idx = center + tap_idx;
+            if sample_idx >= half_taps && sample_idx - half_taps < samples.len() {
+                filtered += samples[sample_idx - half_taps] * coeff;
+            }
+        }
+        output.push(filtered);
     }
 
     output
@@ -466,5 +663,39 @@ mod tests {
         assert!(!spec.is_empty());
         assert_eq!(spec.len(), freq.len());
         assert_eq!(spec.len() % 2, 0);
+    }
+
+    #[test]
+    fn window_functions_validity() {
+        let samples = vec![Complex::new(1.0, 0.0); 128];
+        for win in FftWindow::ALL {
+            let mut buf = samples.clone();
+            win.apply(&mut buf);
+            assert_eq!(buf.len(), 128);
+            if win == FftWindow::Hanning || win == FftWindow::BlackmanHarris {
+                assert!(buf[0].norm() < 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn adc_non_idealities_hd2_hd3() {
+        let samples: Vec<Complex<f64>> = (0..512)
+            .map(|i| {
+                let phi = 2.0 * PI * 0.1 * i as f64;
+                Complex::new(phi.cos(), phi.sin())
+            })
+            .collect();
+
+        let mut non = crate::rfdc::AdcNonIdealities::default();
+        non.enabled = true;
+        non.hd2_dbc = -30.0;
+        non.hd3_dbc = -40.0;
+
+        let distorted = apply_adc_non_idealities(&samples, &non);
+        assert_eq!(distorted.len(), samples.len());
+        // Distorted samples should differ from pure sine
+        let diff: f64 = samples.iter().zip(distorted.iter()).map(|(a, b)| (a - b).norm()).sum();
+        assert!(diff > 1.0);
     }
 }
