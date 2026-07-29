@@ -48,9 +48,24 @@ pub struct RfSocSimApp {
 
 impl Default for RfSocSimApp {
     fn default() -> Self {
+        let mut snarl = Snarl::new();
+        
+        let src_id = snarl.insert_node(
+            egui::pos2(-400.0, 0.0),
+            RfNode::SignalSource(crate::node_graph::nodes::SignalSourceNode::default()),
+        );
+        let adc_id = snarl.insert_node(
+            egui::pos2(400.0, 0.0),
+            RfNode::AdcInput(crate::node_graph::nodes::AdcInputNode::default()),
+        );
+        snarl.connect(
+            egui_snarl::OutPinId { node: src_id, output: 0 },
+            egui_snarl::InPinId { node: adc_id, input: 0 },
+        );
+
         Self {
             rfdc: RfdcConfig::default(),
-            snarl: Snarl::new(),
+            snarl,
             selected_tile: 0,
             selected_block: 0,
             active_tab: Tab::Overview,
@@ -110,10 +125,17 @@ impl RfSocSimApp {
                 res.samples,
                 Some((res.rf_chain_response_db, res.rf_chain_freq_axis_mhz)),
             ),
-            None => (
-                self.signal_gen.generate_at_time(num_samples, input_sample_rate_mhz, self.simulation_time_us),
-                None,
-            ),
+            None => {
+                let empty_gen = SignalGenerator {
+                    tones: vec![],
+                    noise_floor_dbfs: self.signal_gen.noise_floor_dbfs,
+                    noise_enabled: self.signal_gen.noise_enabled,
+                };
+                (
+                    empty_gen.generate_at_time(num_samples, input_sample_rate_mhz, self.simulation_time_us),
+                    None,
+                )
+            }
         };
 
         let raw_samples = self.signal_gen.generate_at_time(num_samples, input_sample_rate_mhz, self.simulation_time_us);

@@ -525,6 +525,8 @@ pub fn show_node_graph(ui: &mut egui::Ui, snarl: &mut Snarl<RfNode>) {
     style.pin_size = Some(10.0);
     style.pin_placement = Some(egui_snarl::ui::PinPlacement::Edge);
     style.wire_style = Some(egui_snarl::ui::WireStyle::Bezier5);
+    style.downscale_wire_frame = Some(true);
+    style.crisp_magnified_text = Some(true);
     
     SnarlWidget::new()
         .style(style)
