@@ -7,6 +7,13 @@ use crate::rfdc::RfdcConfig;
 use crate::signal::SignalGenerator;
 use crate::ui::{config_panel, nyquist_view, spectrum_view, theme::Theme, tile_overview};
 use egui_snarl::Snarl;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct SimulatorState {
+    snarl: Snarl<RfNode>,
+    rfdc: RfdcConfig,
+}
 
 /// The active tab in the main content area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +208,44 @@ impl eframe::App for RfSocSimApp {
 
                     if ui.button("🔄 Recompute").clicked() {
                         self.recompute_signal();
+                    }
+
+                    ui.separator();
+
+                    if ui.button("📂 Load").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("JSON Graph", &["json"])
+                            .pick_file()
+                        {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                // Try parsing as new SimulatorState format
+                                if let Ok(state) = serde_json::from_str::<SimulatorState>(&content) {
+                                    self.snarl = state.snarl;
+                                    self.rfdc = state.rfdc;
+                                    self.recompute_signal();
+                                } 
+                                // Fallback to old Snarl-only format for backward compatibility
+                                else if let Ok(snarl) = serde_json::from_str(&content) {
+                                    self.snarl = snarl;
+                                    self.recompute_signal();
+                                }
+                            }
+                        }
+                    }
+
+                    if ui.button("💾 Save").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("JSON Graph", &["json"])
+                            .save_file()
+                        {
+                            let state = SimulatorState {
+                                snarl: self.snarl.clone(),
+                                rfdc: self.rfdc.clone(),
+                            };
+                            if let Ok(content) = serde_json::to_string_pretty(&state) {
+                                let _ = std::fs::write(&path, content);
+                            }
+                        }
                     }
 
                     ui.separator();

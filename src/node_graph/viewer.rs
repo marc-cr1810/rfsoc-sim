@@ -35,7 +35,7 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
         let n = &snarl[node];
         let color = match n {
             RfNode::SignalSource(_) => Theme::NODE_SOURCE,
-            RfNode::Balun(_) | RfNode::Filter(_) | RfNode::Attenuator(_) | RfNode::Splitter(_) | RfNode::PhaseShifter(_) | RfNode::DirectionalCoupler(_) | RfNode::S2p(_) => Theme::NODE_PASSIVE,
+            RfNode::Balun(_) | RfNode::Filter(_) | RfNode::Attenuator(_) | RfNode::Splitter(_) | RfNode::Combiner(_) | RfNode::PhaseShifter(_) | RfNode::DirectionalCoupler(_) | RfNode::S2p(_) => Theme::NODE_PASSIVE,
             RfNode::Amplifier(_) | RfNode::Mixer(_) => Theme::NODE_ACTIVE,
             RfNode::AdcInput(_) => Theme::NODE_SINK,
         };
@@ -60,6 +60,7 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
             RfNode::Amplifier(_) => (egui_phosphor::regular::SPEAKER_HIFI, n.title()),
             RfNode::Attenuator(_) => (egui_phosphor::regular::SLIDERS_HORIZONTAL, n.title()),
             RfNode::Splitter(_) => (egui_phosphor::regular::GIT_MERGE, n.title()),
+            RfNode::Combiner(_) => (egui_phosphor::regular::ARROWS_IN_SIMPLE, n.title()),
             RfNode::Mixer(_) => (egui_phosphor::regular::WAVES, n.title()),
             RfNode::PhaseShifter(_) => (egui_phosphor::regular::CLOCK, n.title()),
             RfNode::DirectionalCoupler(_) => (egui_phosphor::regular::ROWS, n.title()),
@@ -74,11 +75,19 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
 
     fn show_input(
         &mut self,
-        _pin: &InPin,
+        pin: &InPin,
         ui: &mut egui::Ui,
-        _snarl: &mut Snarl<RfNode>,
+        snarl: &mut Snarl<RfNode>,
     ) -> impl egui_snarl::ui::SnarlPin + 'static {
-        ui.label("RF In");
+        let node = &snarl[pin.id.node];
+        match node {
+            RfNode::Combiner(_) => {
+                ui.label(format!("In {}", pin.id.input));
+            }
+            _ => {
+                ui.label("RF In");
+            }
+        }
         PinInfo::circle().with_fill(RF_WIRE_COLOR).with_stroke(egui::Stroke::NONE)
     }
 
@@ -185,6 +194,38 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                             if ui.selectable_value(&mut current_name, "TCM2-33WX+".to_string(), "TCM2-33WX+").changed() {
                                 balun.model = super::components::BalunModel::default();
                             }
+                            if ui.selectable_value(&mut current_name, "XM655 Band 1".to_string(), "XM655 Band 1 (10-1000 MHz)").changed() {
+                                balun.model = super::components::BalunModel {
+                                    name: "XM655 Band 1".to_string(),
+                                    il_table: vec![(10.0, 1.0), (1000.0, 1.5)],
+                                    min_freq_mhz: 10.0,
+                                    max_freq_mhz: 1000.0,
+                                };
+                            }
+                            if ui.selectable_value(&mut current_name, "XM655 Band 2".to_string(), "XM655 Band 2 (1-4 GHz)").changed() {
+                                balun.model = super::components::BalunModel {
+                                    name: "XM655 Band 2".to_string(),
+                                    il_table: vec![(1000.0, 1.0), (4000.0, 2.0)],
+                                    min_freq_mhz: 1000.0,
+                                    max_freq_mhz: 4000.0,
+                                };
+                            }
+                            if ui.selectable_value(&mut current_name, "XM655 Band 3".to_string(), "XM655 Band 3 (4-5 GHz)").changed() {
+                                balun.model = super::components::BalunModel {
+                                    name: "XM655 Band 3".to_string(),
+                                    il_table: vec![(4000.0, 1.5), (5000.0, 2.0)],
+                                    min_freq_mhz: 4000.0,
+                                    max_freq_mhz: 5000.0,
+                                };
+                            }
+                            if ui.selectable_value(&mut current_name, "XM655 Band 4".to_string(), "XM655 Band 4 (5-6 GHz)").changed() {
+                                balun.model = super::components::BalunModel {
+                                    name: "XM655 Band 4".to_string(),
+                                    il_table: vec![(5000.0, 1.5), (6000.0, 2.5)],
+                                    min_freq_mhz: 5000.0,
+                                    max_freq_mhz: 6000.0,
+                                };
+                            }
                             if ui.selectable_value(&mut current_name, "Ideal".to_string(), "Ideal").changed() {
                                 balun.model = super::components::BalunModel {
                                     name: "Ideal".to_string(),
@@ -193,11 +234,31 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                                     max_freq_mhz: 10000.0,
                                 };
                             }
+                            if ui.selectable_value(&mut current_name, "Custom".to_string(), "Custom").changed() {
+                                balun.model = super::components::BalunModel {
+                                    name: "Custom".to_string(),
+                                    il_table: vec![(0.0, 0.0), (10000.0, 0.0)],
+                                    min_freq_mhz: 10.0,
+                                    max_freq_mhz: 1000.0,
+                                };
+                            }
                         });
-                    ui.label(format!(
-                        "{:.0}–{:.0} MHz",
-                        balun.model.min_freq_mhz, balun.model.max_freq_mhz
-                    ));
+
+                    if balun.model.name == "Custom" {
+                        egui::Grid::new(format!("balun_grid_{:?}", node_id))
+                            .num_columns(2)
+                            .spacing([4.0, 3.0])
+                            .show(ui, |ui| {
+                                ui.label("Min:");
+                                ui.add(egui::DragValue::new(&mut balun.model.min_freq_mhz).suffix(" MHz").speed(10.0));
+                                ui.end_row();
+                                ui.label("Max:");
+                                ui.add(egui::DragValue::new(&mut balun.model.max_freq_mhz).suffix(" MHz").speed(10.0));
+                                ui.end_row();
+                            });
+                    } else {
+                        ui.label(format!("{:.0}–{:.0} MHz", balun.model.min_freq_mhz, balun.model.max_freq_mhz));
+                    }
                 }
                 RfNode::Filter(filter) => {
                     let mut ft = filter.model.filter_type;
@@ -308,6 +369,24 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                             ui.end_row();
                         });
                     ui.label(format!("Total Loss: {:.1} dB", spl.model.total_loss_db()));
+                }
+                RfNode::Combiner(comb) => {
+                    egui::Grid::new(format!("comb_grid_{:?}", node_id))
+                        .num_columns(2)
+                        .spacing([4.0, 3.0])
+                        .show(ui, |ui| {
+                            ui.label("Ports:");
+                            ui.add(egui::DragValue::new(&mut comb.model.num_inputs).range(2..=8));
+                            ui.end_row();
+
+                            ui.label("Loss:");
+                            ui.add(egui::DragValue::new(&mut comb.model.excess_loss_db)
+                                .range(0.0..=10.0)
+                                .suffix(" dB")
+                                .speed(0.1));
+                            ui.end_row();
+                        });
+                    ui.label(format!("Total Loss: {:.1} dB", comb.model.total_loss_db()));
                 }
                 RfNode::Mixer(mix) => {
                     egui::Grid::new(format!("mix_grid_{:?}", node_id))
@@ -474,6 +553,10 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
         }
         if ui.button(format!("{} Splitter", egui_phosphor::regular::GIT_MERGE)).clicked() {
             snarl.insert_node(pos, RfNode::Splitter(SplitterNode::default()));
+            ui.close();
+        }
+        if ui.button(format!("{} Combiner", egui_phosphor::regular::ARROWS_IN_SIMPLE)).clicked() {
+            snarl.insert_node(pos, RfNode::Combiner(CombinerNode::default()));
             ui.close();
         }
         if ui.button(format!("{} Mixer", egui_phosphor::regular::WAVES)).clicked() {

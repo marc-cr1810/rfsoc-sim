@@ -22,6 +22,7 @@ pub enum RfNode {
     Amplifier(AmplifierNode),
     Attenuator(AttenuatorNode),
     Splitter(SplitterNode),
+    Combiner(CombinerNode),
     Mixer(MixerNode),
     PhaseShifter(PhaseShifterNode),
     DirectionalCoupler(DirectionalCouplerNode),
@@ -43,6 +44,7 @@ impl RfNode {
             RfNode::Amplifier(_) => "Amplifier",
             RfNode::Attenuator(_) => "Attenuator",
             RfNode::Splitter(_) => "Splitter",
+            RfNode::Combiner(_) => "Combiner",
             RfNode::Mixer(_) => "Mixer",
             RfNode::PhaseShifter(_) => "Phase Shifter",
             RfNode::DirectionalCoupler(_) => "Directional Coupler",
@@ -56,6 +58,7 @@ impl RfNode {
         match self {
             RfNode::SignalSource(_) => 0,
             RfNode::Splitter(_) => 1,
+            RfNode::Combiner(c) => c.model.num_inputs as usize,
             RfNode::AdcInput(_) => 1,
             _ => 1,
         }
@@ -66,6 +69,7 @@ impl RfNode {
         match self {
             RfNode::AdcInput(_) => 0,
             RfNode::Splitter(s) => s.model.num_outputs as usize,
+            RfNode::Combiner(_) => 1,
             _ => 1,
         }
     }
@@ -80,6 +84,7 @@ impl RfNode {
             RfNode::Amplifier(a) => a.model.apply(&mut output),
             RfNode::Attenuator(a) => a.model.apply(&mut output),
             RfNode::Splitter(s) => s.model.apply(&mut output),
+            RfNode::Combiner(c) => c.model.apply(&mut output),
             RfNode::Mixer(m) => m.model.apply(&mut output),
             RfNode::PhaseShifter(p) => p.model.apply(&mut output),
             RfNode::DirectionalCoupler(d) => d.model.apply(&mut output),
@@ -184,6 +189,19 @@ impl Default for SplitterNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CombinerNode {
+    pub model: CombinerModel,
+}
+
+impl Default for CombinerNode {
+    fn default() -> Self {
+        Self {
+            model: CombinerModel::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MixerNode {
     pub model: MixerModel,
 }
@@ -269,6 +287,88 @@ pub struct GraphEvaluationResult {
     pub cascaded_oip3_dbm: f64,
 }
 
+/// Recursively traverses the node graph backward from a given node, gathering and combining
+/// complex IQ samples from all active sources.
+fn evaluate_dsp_samples_recursively(
+    snarl: &egui_snarl::Snarl<RfNode>,
+    node_id: egui_snarl::NodeId,
+    num_samples: usize,
+    sample_rate_mhz: f64,
+    global_signal_gen: &SignalGenerator,
+    time_us: f64,
+) -> Option<Vec<Complex<f64>>> {
+    let node = &snarl[node_id];
+
+    if let RfNode::SignalSource(src) = node {
+        return Some(match src.source_type {
+            SourceType::GlobalGenerator => global_signal_gen.generate_at_time(num_samples, sample_rate_mhz, time_us),
+            SourceType::LocalGenerator => src.generator.generate_at_time(num_samples, sample_rate_mhz, time_us),
+            SourceType::IqFile => src
+                .file_loader
+                .load()
+                .unwrap_or_else(|_| src.generator.generate_at_time(num_samples, sample_rate_mhz, time_us)),
+        });
+    }
+
+    // Gather samples from all connected inputs
+    let num_inputs = node.num_inputs();
+    let mut input_signals = Vec::new();
+    
+    for input_idx in 0..num_inputs {
+        let pin = snarl.in_pin(egui_snarl::InPinId {
+            node: node_id,
+            input: input_idx,
+        });
+        
+        if let Some(remote_out_pin_id) = pin.remotes.first() {
+            if let Some(samples) = evaluate_dsp_samples_recursively(
+                snarl,
+                remote_out_pin_id.node,
+                num_samples,
+                sample_rate_mhz,
+                global_signal_gen,
+                time_us,
+            ) {
+                input_signals.push(samples);
+            }
+        }
+    }
+
+    if input_signals.is_empty() {
+        return None;
+    }
+
+    // If Combiner, sum them all in time domain
+    let mut combined = input_signals[0].clone();
+    if let RfNode::Combiner(_) = node {
+        for other_signal in input_signals.iter().skip(1) {
+            for (c, o) in combined.iter_mut().zip(other_signal.iter()) {
+                *c += *o;
+            }
+        }
+    }
+
+    // Process the combined samples through the node's DSP logic
+    let processed = match node {
+        RfNode::Balun(b) => b.model.process_samples(&combined, sample_rate_mhz),
+        RfNode::Filter(f) => f.model.process_samples(&combined, sample_rate_mhz),
+        RfNode::Amplifier(a) => a.model.process_samples(&combined),
+        RfNode::Attenuator(a) => a.model.process_samples(&combined),
+        RfNode::Splitter(s) => s.model.process_samples(&combined),
+        RfNode::Combiner(c) => {
+            c.model.process_samples(&mut combined);
+            combined
+        },
+        RfNode::Mixer(m) => m.model.process_samples(&combined, sample_rate_mhz),
+        RfNode::PhaseShifter(p) => p.model.process_samples(&combined),
+        RfNode::DirectionalCoupler(d) => d.model.process_samples(&combined),
+        RfNode::S2p(s) => s.model.process_samples(&combined, sample_rate_mhz),
+        RfNode::SignalSource(_) | RfNode::AdcInput(_) => combined,
+    };
+
+    Some(processed)
+}
+
 /// Traverses the Snarl node graph backwards from an `AdcInput(target_tile, target_block)` node,
 /// generating complex IQ samples from an upstream `SignalSource` and applying each connected
 /// component's DSP transfer function.
@@ -327,34 +427,14 @@ pub fn evaluate_graph(
 
     node_chain.reverse();
 
-    let first_node = &snarl[node_chain[0]];
-    let mut current_samples = match first_node {
-        RfNode::SignalSource(src) => match src.source_type {
-            SourceType::GlobalGenerator => global_signal_gen.generate_at_time(num_samples, sample_rate_mhz, time_us),
-            SourceType::LocalGenerator => src.generator.generate_at_time(num_samples, sample_rate_mhz, time_us),
-            SourceType::IqFile => src
-                .file_loader
-                .load()
-                .unwrap_or_else(|_| src.generator.generate_at_time(num_samples, sample_rate_mhz, time_us)),
-        },
-        _ => return None,
-    };
-
-    for &node_id in &node_chain[1..] {
-        let node = &snarl[node_id];
-        current_samples = match node {
-            RfNode::Balun(b) => b.model.process_samples(&current_samples, sample_rate_mhz),
-            RfNode::Filter(f) => f.model.process_samples(&current_samples, sample_rate_mhz),
-            RfNode::Amplifier(a) => a.model.process_samples(&current_samples),
-            RfNode::Attenuator(a) => a.model.process_samples(&current_samples),
-            RfNode::Splitter(s) => s.model.process_samples(&current_samples),
-            RfNode::Mixer(m) => m.model.process_samples(&current_samples, sample_rate_mhz),
-            RfNode::PhaseShifter(p) => p.model.process_samples(&current_samples),
-            RfNode::DirectionalCoupler(d) => d.model.process_samples(&current_samples),
-            RfNode::S2p(s) => s.model.process_samples(&current_samples, sample_rate_mhz),
-            RfNode::SignalSource(_) | RfNode::AdcInput(_) => current_samples,
-        };
-    }
+    let current_samples = evaluate_dsp_samples_recursively(
+        snarl, 
+        adc_node_id, 
+        num_samples, 
+        sample_rate_mhz, 
+        global_signal_gen, 
+        time_us
+    )?;
 
     // Compute cumulative frequency response curve across 0..sample_rate_mhz / 2
     let num_resp_bins = 256;
@@ -374,6 +454,7 @@ pub fn evaluate_graph(
                 RfNode::Amplifier(a) => rf_chain_response_db[bin] += a.model.gain_db,
                 RfNode::Attenuator(a) => rf_chain_response_db[bin] -= a.model.attenuation_db,
                 RfNode::Splitter(s) => rf_chain_response_db[bin] -= s.model.total_loss_db(),
+                RfNode::Combiner(c) => rf_chain_response_db[bin] -= c.model.total_loss_db(),
                 RfNode::Mixer(m) => rf_chain_response_db[bin] -= m.model.conversion_loss_db,
                 RfNode::PhaseShifter(p) => rf_chain_response_db[bin] -= p.model.insertion_loss_db,
                 RfNode::DirectionalCoupler(d) => rf_chain_response_db[bin] -= d.model.insertion_loss_db,
@@ -403,6 +484,10 @@ pub fn evaluate_graph(
             RfNode::Attenuator(a) => (-a.model.attenuation_db, a.model.attenuation_db, 10.0),
             RfNode::Splitter(s) => {
                 let loss = s.model.total_loss_db();
+                (-loss, loss, 100.0)
+            }
+            RfNode::Combiner(c) => {
+                let loss = c.model.total_loss_db();
                 (-loss, loss, 100.0)
             }
             RfNode::Mixer(m) => (-m.model.conversion_loss_db, m.model.conversion_loss_db, 20.0),

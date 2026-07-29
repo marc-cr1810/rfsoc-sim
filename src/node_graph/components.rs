@@ -635,6 +635,49 @@ pub fn parse_touchstone_s2p(name: &str, content: &str) -> Result<S2pModel, Strin
     })
 }
 
+// ---------------------------------------------------------------------------
+// Combiner Model
+// ---------------------------------------------------------------------------
+
+/// RF Combiner model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CombinerModel {
+    /// Number of input ports (2-8).
+    pub num_inputs: u32,
+    /// Excess loss in dB beyond the theoretical split ratio.
+    pub excess_loss_db: f64,
+}
+
+impl Default for CombinerModel {
+    fn default() -> Self {
+        Self {
+            num_inputs: 2,
+            excess_loss_db: 0.5,
+        }
+    }
+}
+
+impl CombinerModel {
+    pub fn total_loss_db(&self) -> f64 {
+        // Ideal combiner loss + excess insertion loss
+        10.0 * (self.num_inputs as f64).log10() + self.excess_loss_db
+    }
+
+    pub fn apply(&self, spectrum: &mut Spectrum) {
+        let loss = self.total_loss_db();
+        for mag in &mut spectrum.magnitude_dbfs {
+            *mag -= loss;
+        }
+    }
+
+    pub fn process_samples(&self, combined_input: &mut [Complex<f64>]) {
+        let scale = 10.0_f64.powf(-self.total_loss_db() / 20.0);
+        for sample in combined_input.iter_mut() {
+            *sample *= scale;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
