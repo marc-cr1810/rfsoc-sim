@@ -123,12 +123,23 @@ impl Default for BalunModel {
 impl BalunModel {
     /// Get the interpolated insertion loss at a given frequency.
     pub fn insertion_loss_at(&self, freq_mhz: f64) -> f64 {
+        // High attenuation when out of band
+        if freq_mhz < self.min_freq_mhz {
+            let ratio = freq_mhz / self.min_freq_mhz;
+            let db_drop = 200.0 * (1.0 - ratio).powf(4.0); // Up to 200 dB out-of-band rejection
+            return self.il_table.first().unwrap().1 + db_drop;
+        }
+        if freq_mhz > self.max_freq_mhz {
+            let ratio = self.max_freq_mhz / freq_mhz;
+            let db_drop = 200.0 * (1.0 - ratio).powf(4.0);
+            return self.il_table.last().unwrap().1 + db_drop;
+        }
+
         if freq_mhz <= self.il_table[0].0 {
             return self.il_table[0].1;
         }
         if freq_mhz >= self.il_table.last().unwrap().0 {
-            // Beyond operating range — very high loss
-            return self.il_table.last().unwrap().1 + 10.0;
+            return self.il_table.last().unwrap().1;
         }
 
         // Linear interpolation between table points

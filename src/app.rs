@@ -218,15 +218,9 @@ impl eframe::App for RfSocSimApp {
                             .pick_file()
                         {
                             if let Ok(content) = std::fs::read_to_string(&path) {
-                                // Try parsing as new SimulatorState format
                                 if let Ok(state) = serde_json::from_str::<SimulatorState>(&content) {
                                     self.snarl = state.snarl;
                                     self.rfdc = state.rfdc;
-                                    self.recompute_signal();
-                                } 
-                                // Fallback to old Snarl-only format for backward compatibility
-                                else if let Ok(snarl) = serde_json::from_str(&content) {
-                                    self.snarl = snarl;
                                     self.recompute_signal();
                                 }
                             }
