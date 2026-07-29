@@ -24,6 +24,51 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
         node.num_outputs()
     }
 
+    fn header_frame(
+        &mut self,
+        default: egui::Frame,
+        node: NodeId,
+        _inputs: &[InPin],
+        _outputs: &[OutPin],
+        snarl: &Snarl<RfNode>,
+    ) -> egui::Frame {
+        let n = &snarl[node];
+        let color = match n {
+            RfNode::SignalSource(_) => Theme::NODE_SOURCE,
+            RfNode::Balun(_) | RfNode::Filter(_) | RfNode::Attenuator(_) | RfNode::Splitter(_) | RfNode::S2p(_) => Theme::NODE_PASSIVE,
+            RfNode::Amplifier(_) => Theme::NODE_ACTIVE,
+            RfNode::AdcInput(_) => Theme::NODE_SINK,
+        };
+        default
+            .fill(color.linear_multiply(0.25))
+            .inner_margin(egui::Margin::same(6))
+    }
+
+    fn show_header(
+        &mut self,
+        node: NodeId,
+        _inputs: &[InPin],
+        _outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<RfNode>,
+    ) {
+        let n = &snarl[node];
+        let (icon, title) = match n {
+            RfNode::SignalSource(_) => (egui_phosphor::regular::WAVE_SAWTOOTH, n.title()),
+            RfNode::Balun(_) => (egui_phosphor::regular::ARROWS_LEFT_RIGHT, n.title()),
+            RfNode::Filter(_) => (egui_phosphor::regular::FUNNEL, n.title()),
+            RfNode::Amplifier(_) => (egui_phosphor::regular::SPEAKER_HIFI, n.title()),
+            RfNode::Attenuator(_) => (egui_phosphor::regular::SLIDERS_HORIZONTAL, n.title()),
+            RfNode::Splitter(_) => (egui_phosphor::regular::GIT_MERGE, n.title()),
+            RfNode::S2p(_) => (egui_phosphor::regular::FILE_TEXT, n.title()),
+            RfNode::AdcInput(_) => (egui_phosphor::regular::CPU, n.title()),
+        };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(icon).strong().color(Theme::TEXT_PRIMARY));
+            ui.label(egui::RichText::new(title).strong().color(Theme::TEXT_PRIMARY));
+        });
+    }
+
     fn show_input(
         &mut self,
         _pin: &InPin,
@@ -31,7 +76,7 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
         _snarl: &mut Snarl<RfNode>,
     ) -> impl egui_snarl::ui::SnarlPin + 'static {
         ui.label("RF In");
-        PinInfo::circle().with_fill(RF_WIRE_COLOR)
+        PinInfo::circle().with_fill(RF_WIRE_COLOR).with_stroke(egui::Stroke::NONE)
     }
 
     fn show_output(
@@ -49,7 +94,7 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                 ui.label("RF Out");
             }
         }
-        PinInfo::circle().with_fill(RF_WIRE_COLOR)
+        PinInfo::circle().with_fill(RF_WIRE_COLOR).with_stroke(egui::Stroke::NONE)
     }
 
     fn has_body(&mut self, _node: &RfNode) -> bool {
@@ -220,12 +265,12 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                         });
                 }
                 RfNode::Splitter(spl) => {
-                    ui.label(format!("{}-way split", spl.model.num_outputs));
-                    ui.label(format!("Loss: {:.1} dB", spl.model.total_loss_db()));
+                    ui.add(egui::Label::new(format!("{}-way split", spl.model.num_outputs)).wrap_mode(egui::TextWrapMode::Extend));
+                    ui.add(egui::Label::new(format!("Loss: {:.1} dB", spl.model.total_loss_db())).wrap_mode(egui::TextWrapMode::Extend));
                 }
                 RfNode::S2p(s2p) => {
-                    ui.label(egui::RichText::new(&s2p.model.name).small().strong());
-                    ui.label(format!("Pts: {}", s2p.model.s21_table.len()));
+                    ui.add(egui::Label::new(egui::RichText::new(&s2p.model.name).small().strong()).wrap_mode(egui::TextWrapMode::Extend));
+                    ui.add(egui::Label::new(format!("Pts: {}", s2p.model.s21_table.len())).wrap_mode(egui::TextWrapMode::Extend));
                     if ui.button("📂 Load .s2p").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Touchstone S2P", &["s2p"])
@@ -270,52 +315,52 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
     ) {
         ui.label("Add Node");
         ui.separator();
-        if ui.button("🎵 Signal Source").clicked() {
+        if ui.button(format!("{} Signal Source", egui_phosphor::regular::WAVE_SAWTOOTH)).clicked() {
             snarl.insert_node(pos, RfNode::SignalSource(SignalSourceNode::default()));
             ui.close();
         }
-        if ui.button("🔄 Balun").clicked() {
+        if ui.button(format!("{} Balun", egui_phosphor::regular::ARROWS_LEFT_RIGHT)).clicked() {
             snarl.insert_node(pos, RfNode::Balun(BalunNode::default()));
             ui.close();
         }
         ui.separator();
-        if ui.button("📉 Low-Pass Filter").clicked() {
+        if ui.button(format!("{} Low-Pass Filter", egui_phosphor::regular::FUNNEL)).clicked() {
             let mut f = FilterNode::default();
             f.model.filter_type = super::components::FilterType::LowPass;
             snarl.insert_node(pos, RfNode::Filter(f));
             ui.close();
         }
-        if ui.button("📈 High-Pass Filter").clicked() {
+        if ui.button(format!("{} High-Pass Filter", egui_phosphor::regular::FUNNEL)).clicked() {
             let mut f = FilterNode::default();
             f.model.filter_type = super::components::FilterType::HighPass;
             snarl.insert_node(pos, RfNode::Filter(f));
             ui.close();
         }
-        if ui.button("📊 Band-Pass Filter").clicked() {
+        if ui.button(format!("{} Band-Pass Filter", egui_phosphor::regular::FUNNEL)).clicked() {
             let mut f = FilterNode::default();
             f.model.filter_type = super::components::FilterType::BandPass;
             snarl.insert_node(pos, RfNode::Filter(f));
             ui.close();
         }
         ui.separator();
-        if ui.button("📡 Amplifier").clicked() {
+        if ui.button(format!("{} Amplifier", egui_phosphor::regular::SPEAKER_HIFI)).clicked() {
             snarl.insert_node(pos, RfNode::Amplifier(AmplifierNode::default()));
             ui.close();
         }
-        if ui.button("🔇 Attenuator").clicked() {
+        if ui.button(format!("{} Attenuator", egui_phosphor::regular::SLIDERS_HORIZONTAL)).clicked() {
             snarl.insert_node(pos, RfNode::Attenuator(AttenuatorNode::default()));
             ui.close();
         }
-        if ui.button("🔀 Splitter").clicked() {
+        if ui.button(format!("{} Splitter", egui_phosphor::regular::GIT_MERGE)).clicked() {
             snarl.insert_node(pos, RfNode::Splitter(SplitterNode::default()));
             ui.close();
         }
-        if ui.button("📄 Touchstone .s2p Block").clicked() {
+        if ui.button(format!("{} Touchstone .s2p Block", egui_phosphor::regular::FILE_TEXT)).clicked() {
             snarl.insert_node(pos, RfNode::S2p(S2pNode::default()));
             ui.close();
         }
         ui.separator();
-        if ui.button("⬇ ADC Input").clicked() {
+        if ui.button(format!("{} ADC Input", egui_phosphor::regular::CPU)).clicked() {
             snarl.insert_node(pos, RfNode::AdcInput(AdcInputNode::default()));
             ui.close();
         }
@@ -333,7 +378,7 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<RfNode>,
     ) {
-        if ui.button("🗑 Delete").clicked() {
+        if ui.button(format!("{} Delete", egui_phosphor::regular::TRASH)).clicked() {
             snarl.remove_node(node);
             ui.close();
         }
@@ -342,7 +387,12 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
 
 /// Show the node graph in a UI area.
 pub fn show_node_graph(ui: &mut egui::Ui, snarl: &mut Snarl<RfNode>) {
-    let style = SnarlStyle::new();
+    let mut style = SnarlStyle::new();
+    style.wire_width = Some(3.0);
+    style.pin_size = Some(10.0);
+    style.pin_placement = Some(egui_snarl::ui::PinPlacement::Edge);
+    style.wire_style = Some(egui_snarl::ui::WireStyle::Bezier5);
+    
     SnarlWidget::new()
         .style(style)
         .show(snarl, &mut RfNodeViewer, ui);
