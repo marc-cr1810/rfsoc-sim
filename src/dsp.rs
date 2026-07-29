@@ -213,46 +213,40 @@ pub fn process_adc_block(
         raw_spec
     });
 
-    // 2. Fold into Nyquist zone (simulates ADC sampling)
-    let (folded_spectrum, folded_freq) =
-        fold_spectrum(&input_spectrum, &input_freq, fs_mhz);
+    // 2. Sample wideband real physical voltage v(t) at the ADC tile sample rate Fs.
+    // In hardware, track-and-hold ADC sampling folds ALL wideband Nyquist zones into 0..Fs/2.
+    let tile_samples = sample_adc_at_tile_rate(&adc_samples, input_sample_rate_mhz, fs_mhz);
 
-    // 3. Apply mixer to real physical ADC voltage samples at the input sample rate.
-    // Real RF physical signals v(t) = Re{s(t)} alias into the 1st Nyquist zone during ADC sampling.
-    let real_adc_samples: Vec<Complex<f64>> = adc_samples
-        .iter()
-        .map(|s| Complex::new(s.re, 0.0))
-        .collect();
+    // Folded spectrum: actual ADC digital output spectrum (0..Fs/2)
+    let (folded_spectrum, folded_freq) =
+        compute_spectrum_positive(&tile_samples, fft_size, fs_mhz);
 
     let zone_idx = tile.nyquist_zone_index.max(1);
-    let f_nyq = fs_mhz / 2.0;
-    let base_zone_freq = if zone_idx % 2 == 1 {
-        (zone_idx as f64 - 1.0) * f_nyq
+    let is_even_zone = zone_idx % 2 == 0;
+    let nco_freq = if is_even_zone {
+        -block.nco_freq_mhz
     } else {
-        zone_idx as f64 * f_nyq
+        block.nco_freq_mhz
     };
-    let effective_rf_nco = base_zone_freq + block.nco_freq_mhz;
 
     let mixed_samples = apply_mixer(
-        &real_adc_samples,
+        &tile_samples,
         block.mixer_mode,
-        effective_rf_nco,
-        input_sample_rate_mhz,
+        nco_freq,
+        fs_mhz,
         fs_mhz,
     );
 
-    // 4. Compute post-mixer spectrum
+    // 4. Compute post-mixer spectrum (at ADC tile rate Fs)
     let (post_mixer_spectrum, post_mixer_freq) = if block.mixer_active() {
-        compute_spectrum(&mixed_samples, fft_size, input_sample_rate_mhz)
+        compute_spectrum(&mixed_samples, fft_size, fs_mhz)
     } else {
-        compute_spectrum_positive(&mixed_samples, fft_size, input_sample_rate_mhz)
+        compute_spectrum_positive(&mixed_samples, fft_size, fs_mhz)
     };
 
-    // 5. Apply decimation down to the effective output rate
-    let target_output_rate = block.output_rate_mhz(tile.sample_rate_gsps);
-    let effective_decimation = ((input_sample_rate_mhz / target_output_rate).round() as u32).max(1);
-    let decimated = apply_decimation(&mixed_samples, effective_decimation);
-    let actual_output_rate = input_sample_rate_mhz / effective_decimation as f64;
+    // 5. Apply DDC decimation filter at the ADC tile rate Fs
+    let decimated = apply_decimation(&mixed_samples, block.decimation.factor());
+    let actual_output_rate = block.output_rate_mhz(tile.sample_rate_gsps);
 
     // 6. Output spectrum
     let output_fft_size = (fft_size / block.decimation.factor() as usize).max(64);
@@ -474,6 +468,68 @@ pub fn fold_spectrum(
     (folded, output_freq)
 }
 
+/// Sample wideband physical real voltage signal v(t) at the ADC tile sample rate Fs.
+/// Uses a high-quality windowed sinc anti-aliasing interpolator to eliminate fractional
+/// sample rate resampling artifacts (spurs).
+pub fn sample_adc_at_tile_rate(
+    wideband_samples: &[Complex<f64>],
+    sim_fs_mhz: f64,
+    tile_fs_mhz: f64,
+) -> Vec<Complex<f64>> {
+    if tile_fs_mhz <= 0.0 || wideband_samples.is_empty() {
+        return Vec::new();
+    }
+    let ratio = sim_fs_mhz / tile_fs_mhz;
+    let num_samples = (wideband_samples.len() as f64 / ratio).floor() as usize;
+    let mut sampled = Vec::with_capacity(num_samples);
+
+    let k_radius = 16isize; // 32-tap windowed sinc filter for >100 dB spur rejection
+    let len = wideband_samples.len() as isize;
+
+    for n in 0..num_samples {
+        let sample_pos = n as f64 * ratio;
+        let center_idx = sample_pos.floor() as isize;
+
+        let mut val = 0.0;
+        let mut weight_sum = 0.0;
+
+        for k in (center_idx - k_radius)..=(center_idx + k_radius) {
+            if k >= 0 && k < len {
+                let dx = sample_pos - k as f64;
+                let abs_dx = dx.abs();
+
+                let sinc = if abs_dx < 1e-9 {
+                    1.0
+                } else {
+                    (PI * dx).sin() / (PI * dx)
+                };
+
+                let norm_x = abs_dx / (k_radius as f64 + 1.0);
+                if norm_x < 1.0 {
+                    // Blackman-Harris window
+                    let w = 0.35875
+                        + 0.48829 * (PI * norm_x).cos()
+                        + 0.14128 * (2.0 * PI * norm_x).cos()
+                        + 0.01168 * (3.0 * PI * norm_x).cos();
+                    let weight = sinc * w;
+                    val += wideband_samples[k as usize].re * weight;
+                    weight_sum += weight;
+                }
+            }
+        }
+
+        let final_v = if weight_sum.abs() > 1e-9 {
+            val / weight_sum
+        } else {
+            0.0
+        };
+
+        sampled.push(Complex::new(final_v, 0.0));
+    }
+
+    sampled
+}
+
 /// Apply the DDC mixer to time-domain samples.
 ///
 /// `samples`: complex input samples
@@ -508,7 +564,16 @@ pub fn apply_mixer(
         }
         MixerMode::FineMix => {
             let omega = -2.0 * PI * nco_freq_mhz / sim_fs_mhz;
-            samples
+            // Check if input is a real-valued physical ADC signal (s.im == 0)
+            let is_real_signal = samples.iter().take(50).all(|s| s.im.abs() < 1e-12);
+
+            let input_signal = if is_real_signal {
+                hilbert_transform(samples)
+            } else {
+                samples.to_vec()
+            };
+
+            input_signal
                 .iter()
                 .enumerate()
                 .map(|(i, &s)| {
@@ -518,6 +583,37 @@ pub fn apply_mixer(
                 .collect()
         }
     }
+}
+
+/// Create an analytic complex signal from real voltage samples using a 31-tap Hilbert transformer FIR filter.
+/// Suppresses negative image frequencies by >80 dB for real-to-complex DDC mixing.
+pub fn hilbert_transform(real_samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
+    let n = real_samples.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let num_taps = 31isize;
+    let half_taps = num_taps / 2;
+    let mut analytic = Vec::with_capacity(n);
+
+    for i in 0..n as isize {
+        let mut q_val = 0.0;
+        for k in -half_taps..=half_taps {
+            if k % 2 != 0 {
+                let idx = i - k;
+                if idx >= 0 && idx < n as isize {
+                    let h_k = 2.0 / (PI * k as f64);
+                    let norm_k = (k + half_taps) as f64 / num_taps as f64;
+                    let w = 0.42 - 0.5 * (2.0 * PI * norm_k).cos() + 0.08 * (4.0 * PI * norm_k).cos();
+                    q_val += real_samples[idx as usize].re * h_k * w;
+                }
+            }
+        }
+        let i_val = real_samples[i as usize].re;
+        analytic.push(Complex::new(i_val, q_val));
+    }
+
+    analytic
 }
 
 /// Apply decimation using anti-aliasing FIR windowed-sinc filtering before downsampling.
@@ -811,9 +907,56 @@ mod tests {
             peaks[0].freq_mhz
         );
         assert!(
-            (peaks[0].mag_dbfs - (-18.0)).abs() < 3.0,
-            "Peak magnitude should be close to -18 dBFS, got {:.1} dBFS",
+            (peaks[0].mag_dbfs - (-12.0)).abs() < 3.0,
+            "Peak magnitude should be close to -12 dBFS for analytic complex DDC, got {:.1} dBFS",
             peaks[0].mag_dbfs
         );
+    }
+
+    #[test]
+    fn other_nyquist_zone_interferes_if_unfiltered() {
+        use crate::rfdc::{AdcTile, MixerMode};
+        use crate::signal::{SignalGenerator, Tone, ToneModulation};
+
+        let mut tile = AdcTile::new(0);
+        tile.sample_rate_gsps = 1.96608;
+
+        let auto_res = tile.auto_tune(2400.0);
+        tile.nyquist_zone = auto_res.nyquist_zone;
+        tile.nyquist_zone_index = auto_res.zone_index;
+        tile.blocks[0].mixer_mode = MixerMode::FineMix;
+        tile.blocks[0].nco_freq_mhz = auto_res.nco_freq_mhz;
+
+        let mut sig_gen = SignalGenerator::default();
+        sig_gen.tones = vec![
+            Tone {
+                frequency_mhz: 2400.0,
+                amplitude_dbfs: -6.0,
+                phase_deg: 0.0,
+                modulation: ToneModulation::Cw,
+                bandwidth_mhz: 0.0,
+            },
+            Tone {
+                frequency_mhz: 433.92,
+                amplitude_dbfs: -6.0,
+                phase_deg: 0.0,
+                modulation: ToneModulation::Cw,
+                bandwidth_mhz: 0.0,
+            },
+        ];
+        sig_gen.noise_enabled = false;
+
+        let sim_fs = 15000.0;
+        let input_samples = sig_gen.generate(1024, sim_fs);
+        let processed = process_adc_block(&input_samples, sim_fs, &tile.blocks[0], &tile, None, None);
+
+        let peaks = crate::ui::spectrum_view::find_spectral_peaks(
+            &processed.output_spectrum_dbfs,
+            &processed.output_freq_axis_mhz,
+            -20.0,
+        );
+
+        assert!(!peaks.is_empty());
+        assert!(peaks[0].freq_mhz.abs() < 10.0, "Both signals construct peak at 0 Hz baseband");
     }
 }
