@@ -41,9 +41,9 @@ pub fn show_tile_overview(
 
                 // Status
                 if tile.enabled {
-                    ui.colored_label(Theme::ENABLED, "● Enabled");
+                    ui.colored_label(Theme::ENABLED, format!("{} Enabled", egui_phosphor::regular::CIRCLE));
                 } else {
-                    ui.colored_label(Theme::DISABLED, "● Disabled");
+                    ui.colored_label(Theme::DISABLED, format!("{} Disabled", egui_phosphor::regular::CIRCLE));
                 }
 
                 // Sample rate
