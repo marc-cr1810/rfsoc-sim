@@ -217,8 +217,29 @@ pub fn process_adc_block(
     let (folded_spectrum, folded_freq) =
         fold_spectrum(&input_spectrum, &input_freq, fs_mhz);
 
-    // 3. Apply mixer to input time-domain samples at the input sample rate
-    let mixed_samples = apply_mixer(&adc_samples, block.mixer_mode, block.nco_freq_mhz, input_sample_rate_mhz);
+    // 3. Apply mixer to real physical ADC voltage samples at the input sample rate.
+    // Real RF physical signals v(t) = Re{s(t)} alias into the 1st Nyquist zone during ADC sampling.
+    let real_adc_samples: Vec<Complex<f64>> = adc_samples
+        .iter()
+        .map(|s| Complex::new(s.re, 0.0))
+        .collect();
+
+    let zone_idx = tile.nyquist_zone_index.max(1);
+    let f_nyq = fs_mhz / 2.0;
+    let base_zone_freq = if zone_idx % 2 == 1 {
+        (zone_idx as f64 - 1.0) * f_nyq
+    } else {
+        zone_idx as f64 * f_nyq
+    };
+    let effective_rf_nco = base_zone_freq + block.nco_freq_mhz;
+
+    let mixed_samples = apply_mixer(
+        &real_adc_samples,
+        block.mixer_mode,
+        effective_rf_nco,
+        input_sample_rate_mhz,
+        fs_mhz,
+    );
 
     // 4. Compute post-mixer spectrum
     let (post_mixer_spectrum, post_mixer_freq) = if block.mixer_active() {
@@ -228,16 +249,17 @@ pub fn process_adc_block(
     };
 
     // 5. Apply decimation down to the effective output rate
-    let output_rate = block.output_rate_mhz(tile.sample_rate_gsps);
-    let effective_decimation = ((input_sample_rate_mhz / output_rate).round() as u32).max(1);
+    let target_output_rate = block.output_rate_mhz(tile.sample_rate_gsps);
+    let effective_decimation = ((input_sample_rate_mhz / target_output_rate).round() as u32).max(1);
     let decimated = apply_decimation(&mixed_samples, effective_decimation);
+    let actual_output_rate = input_sample_rate_mhz / effective_decimation as f64;
 
     // 6. Output spectrum
     let output_fft_size = (fft_size / block.decimation.factor() as usize).max(64);
     let (output_spectrum, output_freq) = if block.mixer_active() {
-        compute_spectrum(&decimated, output_fft_size, output_rate)
+        compute_spectrum(&decimated, output_fft_size, actual_output_rate)
     } else {
-        compute_spectrum_positive(&decimated, output_fft_size, output_rate)
+        compute_spectrum_positive(&decimated, output_fft_size, actual_output_rate)
     };
 
     let (rf_chain_response_db, rf_chain_freq_axis_mhz) = match rf_chain_response {
@@ -257,7 +279,7 @@ pub fn process_adc_block(
         post_mixer_freq_axis_mhz: post_mixer_freq,
         output_spectrum_dbfs: output_spectrum,
         output_freq_axis_mhz: output_freq,
-        output_sample_rate_mhz: output_rate,
+        output_sample_rate_mhz: actual_output_rate,
         output_time_samples: decimated,
     }
 }
@@ -453,21 +475,28 @@ pub fn fold_spectrum(
 }
 
 /// Apply the DDC mixer to time-domain samples.
+///
+/// `samples`: complex input samples
+/// `mode`: MixerMode (Bypass, CoarseMix, or FineMix)
+/// `nco_freq_mhz`: fine NCO frequency in MHz
+/// `sim_fs_mhz`: sampling rate of input samples in MHz (wideband simulation rate)
+/// `tile_fs_mhz`: ADC tile sampling rate in MHz
 pub fn apply_mixer(
     samples: &[Complex<f64>],
     mode: MixerMode,
     nco_freq_mhz: f64,
-    fs_mhz: f64,
+    sim_fs_mhz: f64,
+    tile_fs_mhz: f64,
 ) -> Vec<Complex<f64>> {
     match mode {
         MixerMode::Bypass => samples.to_vec(),
         MixerMode::CoarseMix(coarse) => {
-            let freq_ratio = match coarse {
-                CoarseMixFreq::FsOver4 => 0.25,
-                CoarseMixFreq::MinusFsOver4 => -0.25,
-                CoarseMixFreq::FsOver2 => 0.5,
+            let coarse_shift_mhz = match coarse {
+                CoarseMixFreq::FsOver4 => 0.25 * tile_fs_mhz,
+                CoarseMixFreq::MinusFsOver4 => -0.25 * tile_fs_mhz,
+                CoarseMixFreq::FsOver2 => 0.5 * tile_fs_mhz,
             };
-            let omega = -2.0 * PI * freq_ratio; // negative for downconversion
+            let omega = -2.0 * PI * coarse_shift_mhz / sim_fs_mhz; // negative for downconversion
             samples
                 .iter()
                 .enumerate()
@@ -478,7 +507,7 @@ pub fn apply_mixer(
                 .collect()
         }
         MixerMode::FineMix => {
-            let omega = -2.0 * PI * nco_freq_mhz / fs_mhz;
+            let omega = -2.0 * PI * nco_freq_mhz / sim_fs_mhz;
             samples
                 .iter()
                 .enumerate()
@@ -628,7 +657,7 @@ mod tests {
             })
             .collect();
 
-        let mixed = apply_mixer(&samples, MixerMode::CoarseMix(CoarseMixFreq::FsOver4), 0.0, fs);
+        let mixed = apply_mixer(&samples, MixerMode::CoarseMix(CoarseMixFreq::FsOver4), 0.0, fs, fs);
         assert_eq!(mixed.len(), n);
 
         // After mixing with -Fs/4, a tone at Fs/4 should move to ~DC
@@ -643,6 +672,39 @@ mod tests {
         assert!(
             peak_freq.abs() < fs / n as f64 * 2.0,
             "After Fs/4 mix, peak should be near DC, got {peak_freq} MHz"
+        );
+    }
+
+    #[test]
+    fn coarse_mixer_wideband_rate() {
+        // Test coarse mixing when simulation rate (10,000 MHz) != ADC tile rate (4,000 MHz)
+        let sim_fs = 10000.0;
+        let tile_fs = 4000.0; // Fs/4 = 1000 MHz
+        let n = 1024;
+
+        // Generate a 1000 MHz tone sampled at 10,000 MHz
+        let samples: Vec<Complex<f64>> = (0..n)
+            .map(|i| {
+                let t = i as f64 / sim_fs;
+                let angle = 2.0 * PI * 1000.0 * t; // 1000 MHz tone (= tile_fs / 4)
+                Complex::new(angle.cos(), angle.sin())
+            })
+            .collect();
+
+        // Apply CoarseMix Fs/4 (should downshift by tile_fs/4 = 1000 MHz)
+        let mixed = apply_mixer(&samples, MixerMode::CoarseMix(CoarseMixFreq::FsOver4), 0.0, sim_fs, tile_fs);
+
+        let (spectrum, freq_axis) = compute_spectrum_positive(&mixed, n, sim_fs);
+        let (peak_idx, _) = spectrum
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
+
+        let peak_freq = freq_axis[peak_idx];
+        assert!(
+            peak_freq.abs() < sim_fs / n as f64 * 2.0,
+            "1000 MHz tone mixed with Fs/4 coarse mixer (tile Fs=4000 MHz) should land near DC at sim rate 10000 MHz, got {peak_freq} MHz"
         );
     }
 
@@ -700,5 +762,58 @@ mod tests {
         // Distorted samples should differ from pure sine
         let diff: f64 = samples.iter().zip(distorted.iter()).map(|(a, b)| (a - b).norm()).sum();
         assert!(diff > 1.0);
+    }
+
+    #[test]
+    fn process_adc_block_auto_tuned_higher_zone() {
+        use crate::rfdc::{AdcTile, MixerMode};
+        use crate::signal::{SignalGenerator, Tone, ToneModulation};
+
+        // Recreate user scenario: Fs = 1.96608 GSPS (1966.08 MHz), Target = 2400 MHz (Zone 3)
+        let mut tile = AdcTile::new(0);
+        tile.sample_rate_gsps = 1.96608;
+
+        let auto_res = tile.auto_tune(2400.0);
+        tile.nyquist_zone = auto_res.nyquist_zone;
+        tile.nyquist_zone_index = auto_res.zone_index;
+
+        tile.blocks[0].mixer_mode = MixerMode::FineMix;
+        tile.blocks[0].nco_freq_mhz = auto_res.nco_freq_mhz;
+
+        let block = tile.blocks[0].clone();
+
+        // Generate 2400 MHz tone
+        let mut sig_gen = SignalGenerator::default();
+        sig_gen.tones = vec![Tone {
+            frequency_mhz: 2400.0,
+            amplitude_dbfs: -6.0,
+            phase_deg: 0.0,
+            modulation: ToneModulation::Cw,
+            bandwidth_mhz: 0.0,
+        }];
+        sig_gen.noise_enabled = false;
+
+        let sim_fs = 10000.0;
+        let input_samples = sig_gen.generate(1024, sim_fs);
+        let processed = process_adc_block(&input_samples, sim_fs, &block, &tile, Some(&input_samples), None);
+
+        // Find peak in output spectrum
+        let peaks = crate::ui::spectrum_view::find_spectral_peaks(
+            &processed.output_spectrum_dbfs,
+            &processed.output_freq_axis_mhz,
+            -20.0,
+        );
+
+        assert!(!peaks.is_empty(), "Should detect peak near 0 Hz baseband");
+        assert!(
+            peaks[0].freq_mhz.abs() < 10.0,
+            "Auto-tuned 2400 MHz tone in Zone 3 should land at 0 Hz baseband, got {:.1} MHz",
+            peaks[0].freq_mhz
+        );
+        assert!(
+            (peaks[0].mag_dbfs - (-18.0)).abs() < 3.0,
+            "Peak magnitude should be close to -18 dBFS, got {:.1} dBFS",
+            peaks[0].mag_dbfs
+        );
     }
 }

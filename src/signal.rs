@@ -233,9 +233,7 @@ impl SignalGenerator {
                     }
                 }
                 ToneModulation::Cw => {
-                    let period_us = 1.0 / tone.frequency_mhz.max(1e-6);
-                    let t_phase_start = start_time_us % period_us;
-                    let phase_start = 2.0 * PI * tone.frequency_mhz * t_phase_start + phase_rad;
+                    let phase_start = 2.0 * PI * (tone.frequency_mhz * start_time_us).fract() + phase_rad;
                     let phase_step = 2.0 * PI * tone.frequency_mhz * dt;
 
                     for (i, sample) in samples.iter_mut().enumerate() {

@@ -62,7 +62,12 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
     ui.horizontal(|ui| {
         ui.label("Nyquist Zone:");
         for zone in NyquistZone::ALL {
-            ui.selectable_value(&mut tile.nyquist_zone, zone, zone.to_string());
+            if ui.selectable_value(&mut tile.nyquist_zone, zone, zone.to_string()).clicked() {
+                tile.nyquist_zone_index = match zone {
+                    NyquistZone::First => 1,
+                    NyquistZone::Second => 2,
+                };
+            }
         }
     });
 
@@ -285,5 +290,6 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
 
     if let Some(res) = apply_auto_tune {
         tile.nyquist_zone = res.nyquist_zone;
+        tile.nyquist_zone_index = res.zone_index;
     }
 }
