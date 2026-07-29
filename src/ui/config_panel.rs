@@ -61,14 +61,15 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
     // Nyquist zone
     ui.horizontal(|ui| {
         ui.label("Nyquist Zone:");
-        for zone in NyquistZone::ALL {
-            if ui.selectable_value(&mut tile.nyquist_zone, zone, zone.to_string()).clicked() {
-                tile.nyquist_zone_index = match zone {
-                    NyquistZone::First => 1,
-                    NyquistZone::Second => 2,
-                };
-            }
-        }
+        egui::ComboBox::from_id_salt(format!("nyquist_zone_{}", tile.index))
+            .selected_text(tile.nyquist_zone.to_string())
+            .show_ui(ui, |ui| {
+                for zone in NyquistZone::ALL {
+                    if ui.selectable_value(&mut tile.nyquist_zone, zone, zone.to_string()).clicked() {
+                        tile.nyquist_zone_index = zone.index();
+                    }
+                }
+            });
     });
 
     // PLL

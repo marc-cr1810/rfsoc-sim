@@ -55,10 +55,7 @@ pub fn show_tile_overview(
 
                 // Nyquist zone
                 if tile.enabled {
-                    let zone_color = match tile.nyquist_zone {
-                        crate::rfdc::NyquistZone::First => Theme::ZONE_1,
-                        crate::rfdc::NyquistZone::Second => Theme::ZONE_2,
-                    };
+                    let zone_color = Theme::zone_color(tile.nyquist_zone.index() as usize);
                     ui.colored_label(zone_color, tile.nyquist_zone.to_string());
                 } else {
                     ui.colored_label(Theme::TEXT_SECONDARY, "—");

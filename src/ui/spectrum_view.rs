@@ -426,8 +426,13 @@ fn show_single_spectrum(
         } else {
             // Draw Nyquist zone boundaries
             let nyquist_bw = fs_mhz / 2.0;
-            for zone in 1..=6 {
+            let max_freq = freq_axis.last().copied().unwrap_or(7500.0);
+            let max_zone = (max_freq / nyquist_bw).ceil() as usize;
+            for zone in 1..=max_zone {
                 let boundary = zone as f64 * nyquist_bw;
+                if boundary > max_freq {
+                    break;
+                }
                 let zone_line_points: PlotPoints = vec![[boundary, -150.0], [boundary, 10.0]].into();
                 let zone_line = Line::new(format!("{id}_zone_{zone}"), zone_line_points)
                     .color(Theme::zone_color(zone).linear_multiply(0.4))

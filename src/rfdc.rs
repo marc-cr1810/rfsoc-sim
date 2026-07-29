@@ -63,7 +63,7 @@ impl AdcTile {
             index,
             enabled: true,
             sample_rate_gsps: 4.0,
-            nyquist_zone: NyquistZone::First,
+            nyquist_zone: NyquistZone::Zone1,
             nyquist_zone_index: 1,
             pll_enabled: true,
             ref_clk_mhz: 245.76,
@@ -95,7 +95,7 @@ impl AdcTile {
                 target_freq_mhz,
                 zone_index: 1,
                 is_even_zone: false,
-                nyquist_zone: NyquistZone::First,
+                nyquist_zone: NyquistZone::Zone1,
                 alias_freq_mhz: target_freq_mhz,
                 nco_freq_mhz: target_freq_mhz,
             };
@@ -103,11 +103,7 @@ impl AdcTile {
 
         let zone_index = (target_freq_mhz / f_nyq).floor() as u32 + 1;
         let is_even_zone = zone_index % 2 == 0;
-        let nyquist_zone = if is_even_zone {
-            NyquistZone::Second
-        } else {
-            NyquistZone::First
-        };
+        let nyquist_zone = NyquistZone::from_index(zone_index);
 
         let alias_freq_mhz = if is_even_zone {
             (zone_index as f64 * f_nyq) - target_freq_mhz
@@ -204,20 +200,64 @@ impl AdcBlock {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NyquistZone {
-    First,
-    Second,
+    Zone1,
+    Zone2,
+    Zone3,
+    Zone4,
+    Zone5,
+    Zone6,
+    Zone7,
+    Zone8,
 }
 
 impl NyquistZone {
-    pub const ALL: [NyquistZone; 2] = [NyquistZone::First, NyquistZone::Second];
+    pub const ALL: [NyquistZone; 8] = [
+        NyquistZone::Zone1,
+        NyquistZone::Zone2,
+        NyquistZone::Zone3,
+        NyquistZone::Zone4,
+        NyquistZone::Zone5,
+        NyquistZone::Zone6,
+        NyquistZone::Zone7,
+        NyquistZone::Zone8,
+    ];
+
+    pub fn index(&self) -> u32 {
+        match self {
+            Self::Zone1 => 1,
+            Self::Zone2 => 2,
+            Self::Zone3 => 3,
+            Self::Zone4 => 4,
+            Self::Zone5 => 5,
+            Self::Zone6 => 6,
+            Self::Zone7 => 7,
+            Self::Zone8 => 8,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::Zone1,
+            2 => Self::Zone2,
+            3 => Self::Zone3,
+            4 => Self::Zone4,
+            5 => Self::Zone5,
+            6 => Self::Zone6,
+            7 => Self::Zone7,
+            _ => Self::Zone8,
+        }
+    }
+
+    pub const FIRST: NyquistZone = NyquistZone::Zone1;
+    pub const SECOND: NyquistZone = NyquistZone::Zone2;
 }
 
 impl std::fmt::Display for NyquistZone {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NyquistZone::First => write!(f, "1st (0 – Fs/2)"),
-            NyquistZone::Second => write!(f, "2nd (Fs/2 – Fs)"),
-        }
+        let idx = self.index();
+        let is_even = idx % 2 == 0;
+        let mode_str = if is_even { "Even, Mirrored" } else { "Odd, Direct" };
+        write!(f, "Zone {idx} ({mode_str})")
     }
 }
 
@@ -350,18 +390,18 @@ mod tests {
     #[test]
     fn auto_tune_nyquist_zones() {
         let tile = AdcTile::new(0); // 4.0 GSPS -> F_nyq = 2000 MHz
-        // 5800 MHz target -> 5800 / 2000 = 2.9 -> Zone 3 (Odd, Zone 1 mode)
+        // 5800 MHz target -> 5800 / 2000 = 2.9 -> Zone 3 (Odd)
         let res = tile.auto_tune(5800.0);
         assert_eq!(res.zone_index, 3);
         assert!(!res.is_even_zone);
-        assert_eq!(res.nyquist_zone, NyquistZone::First);
+        assert_eq!(res.nyquist_zone, NyquistZone::Zone3);
         assert!((res.alias_freq_mhz - 1800.0).abs() < 1e-6);
 
-        // 3000 MHz target -> 3000 / 2000 = 1.5 -> Zone 2 (Even, Zone 2 mode)
+        // 3000 MHz target -> 3000 / 2000 = 1.5 -> Zone 2 (Even)
         let res2 = tile.auto_tune(3000.0);
         assert_eq!(res2.zone_index, 2);
         assert!(res2.is_even_zone);
-        assert_eq!(res2.nyquist_zone, NyquistZone::Second);
+        assert_eq!(res2.nyquist_zone, NyquistZone::Zone2);
         assert!((res2.alias_freq_mhz - 1000.0).abs() < 1e-6);
     }
 }

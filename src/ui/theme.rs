@@ -25,6 +25,9 @@ impl Theme {
     pub const ZONE_3: Color32 = Color32::from_rgb(160, 90, 255);  // Purple
     pub const ZONE_4: Color32 = Color32::from_rgb(50, 200, 120);  // Green
     pub const ZONE_5: Color32 = Color32::from_rgb(255, 80, 120);  // Pink
+    pub const ZONE_6: Color32 = Color32::from_rgb(220, 220, 50);  // Yellow
+    pub const ZONE_7: Color32 = Color32::from_rgb(0, 220, 220);   // Cyan
+    pub const ZONE_8: Color32 = Color32::from_rgb(255, 120, 220);  // Light Pink
 
     // -- Node colours --
     pub const NODE_SOURCE: Color32 = Color32::from_rgb(50, 180, 80);
@@ -48,7 +51,23 @@ impl Theme {
             2 => Self::ZONE_2,
             3 => Self::ZONE_3,
             4 => Self::ZONE_4,
-            _ => Self::ZONE_5,
+            5 => Self::ZONE_5,
+            6 => Self::ZONE_6,
+            7 => Self::ZONE_7,
+            8 => Self::ZONE_8,
+            _ => {
+                // Cycle colors for higher zones (> 8)
+                match zone % 8 {
+                    1 => Self::ZONE_1,
+                    2 => Self::ZONE_2,
+                    3 => Self::ZONE_3,
+                    4 => Self::ZONE_4,
+                    5 => Self::ZONE_5,
+                    6 => Self::ZONE_6,
+                    7 => Self::ZONE_7,
+                    _ => Self::ZONE_8,
+                }
+            }
         }
     }
 
