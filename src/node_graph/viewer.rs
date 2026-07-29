@@ -35,8 +35,8 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
         let n = &snarl[node];
         let color = match n {
             RfNode::SignalSource(_) => Theme::NODE_SOURCE,
-            RfNode::Balun(_) | RfNode::Filter(_) | RfNode::Attenuator(_) | RfNode::Splitter(_) | RfNode::S2p(_) => Theme::NODE_PASSIVE,
-            RfNode::Amplifier(_) => Theme::NODE_ACTIVE,
+            RfNode::Balun(_) | RfNode::Filter(_) | RfNode::Attenuator(_) | RfNode::Splitter(_) | RfNode::PhaseShifter(_) | RfNode::DirectionalCoupler(_) | RfNode::S2p(_) => Theme::NODE_PASSIVE,
+            RfNode::Amplifier(_) | RfNode::Mixer(_) => Theme::NODE_ACTIVE,
             RfNode::AdcInput(_) => Theme::NODE_SINK,
         };
         default
@@ -60,6 +60,9 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
             RfNode::Amplifier(_) => (egui_phosphor::regular::SPEAKER_HIFI, n.title()),
             RfNode::Attenuator(_) => (egui_phosphor::regular::SLIDERS_HORIZONTAL, n.title()),
             RfNode::Splitter(_) => (egui_phosphor::regular::GIT_MERGE, n.title()),
+            RfNode::Mixer(_) => (egui_phosphor::regular::WAVES, n.title()),
+            RfNode::PhaseShifter(_) => (egui_phosphor::regular::CLOCK, n.title()),
+            RfNode::DirectionalCoupler(_) => (egui_phosphor::regular::ROWS, n.title()),
             RfNode::S2p(_) => (egui_phosphor::regular::FILE_TEXT, n.title()),
             RfNode::AdcInput(_) => (egui_phosphor::regular::CPU, n.title()),
         };
@@ -175,7 +178,22 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                     }
                 }
                 RfNode::Balun(balun) => {
-                    ui.label(egui::RichText::new(&balun.model.name).small().strong());
+                    let mut current_name = balun.model.name.clone();
+                    egui::ComboBox::from_id_salt(format!("balun_combo_{:?}", node_id))
+                        .selected_text(&current_name)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_value(&mut current_name, "TCM2-33WX+".to_string(), "TCM2-33WX+").changed() {
+                                balun.model = super::components::BalunModel::default();
+                            }
+                            if ui.selectable_value(&mut current_name, "Ideal".to_string(), "Ideal").changed() {
+                                balun.model = super::components::BalunModel {
+                                    name: "Ideal".to_string(),
+                                    il_table: vec![(0.0, 0.0), (10000.0, 0.0)],
+                                    min_freq_mhz: 0.0,
+                                    max_freq_mhz: 10000.0,
+                                };
+                            }
+                        });
                     ui.label(format!(
                         "{:.0}–{:.0} MHz",
                         balun.model.min_freq_mhz, balun.model.max_freq_mhz
@@ -247,6 +265,15 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                                     .speed(0.1),
                             );
                             ui.end_row();
+
+                            ui.label("P1dB:");
+                            ui.add(
+                                egui::DragValue::new(&mut amp.model.p1db_dbm)
+                                    .range(-20.0..=50.0)
+                                    .suffix(" dBm")
+                                    .speed(0.5),
+                            );
+                            ui.end_row();
                         });
                 }
                 RfNode::Attenuator(att) => {
@@ -265,12 +292,106 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
                         });
                 }
                 RfNode::Splitter(spl) => {
-                    ui.add(egui::Label::new(format!("{}-way split", spl.model.num_outputs)).wrap_mode(egui::TextWrapMode::Extend));
-                    ui.add(egui::Label::new(format!("Loss: {:.1} dB", spl.model.total_loss_db())).wrap_mode(egui::TextWrapMode::Extend));
+                    egui::Grid::new(format!("split_grid_{:?}", node_id))
+                        .num_columns(2)
+                        .spacing([4.0, 3.0])
+                        .show(ui, |ui| {
+                            ui.label("Ports:");
+                            ui.add(egui::DragValue::new(&mut spl.model.num_outputs).range(2..=8));
+                            ui.end_row();
+
+                            ui.label("Loss:");
+                            ui.add(egui::DragValue::new(&mut spl.model.excess_loss_db)
+                                .range(0.0..=10.0)
+                                .suffix(" dB")
+                                .speed(0.1));
+                            ui.end_row();
+                        });
+                    ui.label(format!("Total Loss: {:.1} dB", spl.model.total_loss_db()));
+                }
+                RfNode::Mixer(mix) => {
+                    egui::Grid::new(format!("mix_grid_{:?}", node_id))
+                        .num_columns(2)
+                        .spacing([4.0, 3.0])
+                        .show(ui, |ui| {
+                            ui.label("LO Freq:");
+                            ui.add(egui::DragValue::new(&mut mix.model.lo_freq_mhz)
+                                .range(0.1..=10000.0)
+                                .suffix(" MHz")
+                                .speed(10.0));
+                            ui.end_row();
+
+                            ui.label("Loss:");
+                            ui.add(egui::DragValue::new(&mut mix.model.conversion_loss_db)
+                                .range(0.0..=30.0)
+                                .suffix(" dB")
+                                .speed(0.5));
+                            ui.end_row();
+                        });
+                }
+                RfNode::PhaseShifter(ps) => {
+                    egui::Grid::new(format!("ps_grid_{:?}", node_id))
+                        .num_columns(2)
+                        .spacing([4.0, 3.0])
+                        .show(ui, |ui| {
+                            ui.label("Phase:");
+                            ui.add(egui::DragValue::new(&mut ps.model.phase_shift_deg)
+                                .range(-360.0..=360.0)
+                                .suffix("°")
+                                .speed(1.0));
+                            ui.end_row();
+
+                            ui.label("Loss:");
+                            ui.add(egui::DragValue::new(&mut ps.model.insertion_loss_db)
+                                .range(0.0..=20.0)
+                                .suffix(" dB")
+                                .speed(0.1));
+                            ui.end_row();
+                        });
+                }
+                RfNode::DirectionalCoupler(dc) => {
+                    egui::Grid::new(format!("dc_grid_{:?}", node_id))
+                        .num_columns(2)
+                        .spacing([4.0, 3.0])
+                        .show(ui, |ui| {
+                            ui.label("Cpl:");
+                            ui.add(egui::DragValue::new(&mut dc.model.coupling_db)
+                                .range(3.0..=50.0)
+                                .suffix(" dB")
+                                .speed(0.5));
+                            ui.end_row();
+
+                            ui.label("Loss:");
+                            ui.add(egui::DragValue::new(&mut dc.model.insertion_loss_db)
+                                .range(0.0..=10.0)
+                                .suffix(" dB")
+                                .speed(0.1));
+                            ui.end_row();
+                        });
                 }
                 RfNode::S2p(s2p) => {
                     ui.add(egui::Label::new(egui::RichText::new(&s2p.model.name).small().strong()).wrap_mode(egui::TextWrapMode::Extend));
                     ui.add(egui::Label::new(format!("Pts: {}", s2p.model.s21_table.len())).wrap_mode(egui::TextWrapMode::Extend));
+                    
+                    egui::Grid::new(format!("s2p_grid_{:?}", node_id))
+                        .num_columns(2)
+                        .spacing([4.0, 3.0])
+                        .show(ui, |ui| {
+                            ui.label("NF:");
+                            ui.add(egui::DragValue::new(&mut s2p.model.noise_figure_db)
+                                .range(0.0..=20.0)
+                                .suffix(" dB")
+                                .speed(0.1));
+                            ui.end_row();
+
+                            ui.label("OIP3:");
+                            ui.add(egui::DragValue::new(&mut s2p.model.oip3_dbm)
+                                .range(0.0..=60.0)
+                                .suffix(" dBm")
+                                .speed(0.5));
+                            ui.end_row();
+                        });
+
                     if ui.button("📂 Load .s2p").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Touchstone S2P", &["s2p"])
@@ -353,6 +474,18 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
         }
         if ui.button(format!("{} Splitter", egui_phosphor::regular::GIT_MERGE)).clicked() {
             snarl.insert_node(pos, RfNode::Splitter(SplitterNode::default()));
+            ui.close();
+        }
+        if ui.button(format!("{} Mixer", egui_phosphor::regular::WAVES)).clicked() {
+            snarl.insert_node(pos, RfNode::Mixer(MixerNode::default()));
+            ui.close();
+        }
+        if ui.button(format!("{} Phase Shifter", egui_phosphor::regular::CLOCK)).clicked() {
+            snarl.insert_node(pos, RfNode::PhaseShifter(PhaseShifterNode::default()));
+            ui.close();
+        }
+        if ui.button(format!("{} Directional Coupler", egui_phosphor::regular::ROWS)).clicked() {
+            snarl.insert_node(pos, RfNode::DirectionalCoupler(DirectionalCouplerNode::default()));
             ui.close();
         }
         if ui.button(format!("{} Touchstone .s2p Block", egui_phosphor::regular::FILE_TEXT)).clicked() {

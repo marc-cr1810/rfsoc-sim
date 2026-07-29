@@ -22,6 +22,9 @@ pub enum RfNode {
     Amplifier(AmplifierNode),
     Attenuator(AttenuatorNode),
     Splitter(SplitterNode),
+    Mixer(MixerNode),
+    PhaseShifter(PhaseShifterNode),
+    DirectionalCoupler(DirectionalCouplerNode),
     S2p(S2pNode),
     AdcInput(AdcInputNode),
 }
@@ -40,6 +43,9 @@ impl RfNode {
             RfNode::Amplifier(_) => "Amplifier",
             RfNode::Attenuator(_) => "Attenuator",
             RfNode::Splitter(_) => "Splitter",
+            RfNode::Mixer(_) => "Mixer",
+            RfNode::PhaseShifter(_) => "Phase Shifter",
+            RfNode::DirectionalCoupler(_) => "Directional Coupler",
             RfNode::S2p(s) => &s.model.name,
             RfNode::AdcInput(_) => "ADC Input",
         }
@@ -74,6 +80,9 @@ impl RfNode {
             RfNode::Amplifier(a) => a.model.apply(&mut output),
             RfNode::Attenuator(a) => a.model.apply(&mut output),
             RfNode::Splitter(s) => s.model.apply(&mut output),
+            RfNode::Mixer(m) => m.model.apply(&mut output),
+            RfNode::PhaseShifter(p) => p.model.apply(&mut output),
+            RfNode::DirectionalCoupler(d) => d.model.apply(&mut output),
             RfNode::S2p(s) => s.model.apply(&mut output),
             RfNode::AdcInput(_) => {} // Sink node, no processing
         }
@@ -170,6 +179,45 @@ impl Default for SplitterNode {
     fn default() -> Self {
         Self {
             model: SplitterModel::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MixerNode {
+    pub model: MixerModel,
+}
+
+impl Default for MixerNode {
+    fn default() -> Self {
+        Self {
+            model: MixerModel::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseShifterNode {
+    pub model: PhaseShifterModel,
+}
+
+impl Default for PhaseShifterNode {
+    fn default() -> Self {
+        Self {
+            model: PhaseShifterModel::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectionalCouplerNode {
+    pub model: DirectionalCouplerModel,
+}
+
+impl Default for DirectionalCouplerNode {
+    fn default() -> Self {
+        Self {
+            model: DirectionalCouplerModel::default(),
         }
     }
 }
@@ -300,6 +348,9 @@ pub fn evaluate_graph(
             RfNode::Amplifier(a) => a.model.process_samples(&current_samples),
             RfNode::Attenuator(a) => a.model.process_samples(&current_samples),
             RfNode::Splitter(s) => s.model.process_samples(&current_samples),
+            RfNode::Mixer(m) => m.model.process_samples(&current_samples, sample_rate_mhz),
+            RfNode::PhaseShifter(p) => p.model.process_samples(&current_samples),
+            RfNode::DirectionalCoupler(d) => d.model.process_samples(&current_samples),
             RfNode::S2p(s) => s.model.process_samples(&current_samples, sample_rate_mhz),
             RfNode::SignalSource(_) | RfNode::AdcInput(_) => current_samples,
         };
@@ -323,6 +374,9 @@ pub fn evaluate_graph(
                 RfNode::Amplifier(a) => rf_chain_response_db[bin] += a.model.gain_db,
                 RfNode::Attenuator(a) => rf_chain_response_db[bin] -= a.model.attenuation_db,
                 RfNode::Splitter(s) => rf_chain_response_db[bin] -= s.model.total_loss_db(),
+                RfNode::Mixer(m) => rf_chain_response_db[bin] -= m.model.conversion_loss_db,
+                RfNode::PhaseShifter(p) => rf_chain_response_db[bin] -= p.model.insertion_loss_db,
+                RfNode::DirectionalCoupler(d) => rf_chain_response_db[bin] -= d.model.insertion_loss_db,
                 RfNode::S2p(s) => rf_chain_response_db[bin] += s.model.s21_gain_at(freq),
                 RfNode::SignalSource(_) | RfNode::AdcInput(_) => {}
             }
@@ -351,6 +405,9 @@ pub fn evaluate_graph(
                 let loss = s.model.total_loss_db();
                 (-loss, loss, 100.0)
             }
+            RfNode::Mixer(m) => (-m.model.conversion_loss_db, m.model.conversion_loss_db, 20.0),
+            RfNode::PhaseShifter(p) => (-p.model.insertion_loss_db, p.model.insertion_loss_db, 100.0),
+            RfNode::DirectionalCoupler(d) => (-d.model.insertion_loss_db, d.model.insertion_loss_db, 100.0),
             RfNode::S2p(s) => (s.model.s21_gain_at(1000.0), s.model.noise_figure_db, s.model.oip3_dbm),
             RfNode::SignalSource(_) | RfNode::AdcInput(_) => (0.0, 0.0, 100.0),
         };

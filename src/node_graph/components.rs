@@ -372,6 +372,127 @@ impl SplitterModel {
 }
 
 // ---------------------------------------------------------------------------
+// Mixer Model
+// ---------------------------------------------------------------------------
+
+/// Mixer model for frequency translation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MixerModel {
+    /// Local Oscillator (LO) frequency in MHz.
+    pub lo_freq_mhz: f64,
+    /// Conversion loss in dB (positive value).
+    pub conversion_loss_db: f64,
+}
+
+impl Default for MixerModel {
+    fn default() -> Self {
+        Self {
+            lo_freq_mhz: 100.0,
+            conversion_loss_db: 7.0,
+        }
+    }
+}
+
+impl MixerModel {
+    pub fn apply(&self, spectrum: &mut Spectrum) {
+        // Idealized apply just adds the conversion loss to the signal path.
+        for mag in &mut spectrum.magnitude_dbfs {
+            *mag -= self.conversion_loss_db;
+        }
+    }
+
+    pub fn process_samples(&self, samples: &[Complex<f64>], sample_rate_mhz: f64) -> Vec<Complex<f64>> {
+        let n = samples.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let dt = 1.0 / sample_rate_mhz; // microseconds
+        let loss_lin = 10.0_f64.powf(-self.conversion_loss_db / 20.0);
+        let omega = 2.0 * std::f64::consts::PI * self.lo_freq_mhz;
+
+        samples.iter().enumerate().map(|(i, &s)| {
+            let t = i as f64 * dt;
+            let lo = Complex::new((omega * t).cos(), (omega * t).sin());
+            s * lo * loss_lin
+        }).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase Shifter Model
+// ---------------------------------------------------------------------------
+
+/// Phase shifter model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseShifterModel {
+    /// Phase shift in degrees.
+    pub phase_shift_deg: f64,
+    /// Insertion loss in dB.
+    pub insertion_loss_db: f64,
+}
+
+impl Default for PhaseShifterModel {
+    fn default() -> Self {
+        Self {
+            phase_shift_deg: 90.0,
+            insertion_loss_db: 1.5,
+        }
+    }
+}
+
+impl PhaseShifterModel {
+    pub fn apply(&self, spectrum: &mut Spectrum) {
+        for mag in &mut spectrum.magnitude_dbfs {
+            *mag -= self.insertion_loss_db;
+        }
+    }
+
+    pub fn process_samples(&self, samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
+        let phase_rad = self.phase_shift_deg.to_radians();
+        let phase_complex = Complex::new(phase_rad.cos(), phase_rad.sin());
+        let loss_lin = 10.0_f64.powf(-self.insertion_loss_db / 20.0);
+        let multiplier = phase_complex * loss_lin;
+        
+        samples.iter().map(|&s| s * multiplier).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Directional Coupler Model
+// ---------------------------------------------------------------------------
+
+/// Directional coupler model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectionalCouplerModel {
+    /// Coupling factor in dB.
+    pub coupling_db: f64,
+    /// Insertion loss of the main line in dB.
+    pub insertion_loss_db: f64,
+}
+
+impl Default for DirectionalCouplerModel {
+    fn default() -> Self {
+        Self {
+            coupling_db: 20.0,
+            insertion_loss_db: 0.5,
+        }
+    }
+}
+
+impl DirectionalCouplerModel {
+    pub fn apply(&self, spectrum: &mut Spectrum) {
+        for mag in &mut spectrum.magnitude_dbfs {
+            *mag -= self.insertion_loss_db;
+        }
+    }
+
+    pub fn process_samples(&self, samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
+        let loss_lin = 10.0_f64.powf(-self.insertion_loss_db / 20.0);
+        samples.iter().map(|&s| s * loss_lin).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Touchstone .s2p S-Parameter Component Model
 // ---------------------------------------------------------------------------
 
