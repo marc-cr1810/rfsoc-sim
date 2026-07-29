@@ -5,7 +5,7 @@
 use crate::rfdc::*;
 
 /// Create a default ZCU208 configuration.
-/// All tiles at 4.0 GSPS, 1st Nyquist zone, bypass mixer, no decimation.
+/// All tiles at 4.0 GSPS, 1st Nyquist zone, mixer off, no decimation.
 pub fn default_zcu208() -> RfdcConfig {
     RfdcConfig::default()
 }
@@ -16,10 +16,12 @@ pub fn wideband_capture() -> RfdcConfig {
     let mut config = RfdcConfig::default();
     for tile in &mut config.adc_tiles {
         tile.sample_rate_gsps = 5.0;
-        tile.nyquist_zone = NyquistZone::SECOND;
         for block in &mut tile.blocks {
-            block.mixer_mode = MixerMode::FineMix;
-            block.nco_freq_mhz = 1250.0;
+            block.nyquist_zone = NyquistZone::Even;
+            block.planner_zone = 2;
+            block.mixer_settings.mixer_type = MixerType::Fine;
+            block.mixer_settings.mixer_mode = MixerMode::RealToIq;
+            block.mixer_settings.freq = 1250.0;
         }
     }
     config
@@ -31,10 +33,12 @@ pub fn narrowband_ddc() -> RfdcConfig {
     let mut config = RfdcConfig::default();
     for tile in &mut config.adc_tiles {
         tile.sample_rate_gsps = 2.0;
-        tile.nyquist_zone = NyquistZone::FIRST;
         for block in &mut tile.blocks {
-            block.mixer_mode = MixerMode::FineMix;
-            block.nco_freq_mhz = 500.0;
+            block.nyquist_zone = NyquistZone::Odd;
+            block.planner_zone = 1;
+            block.mixer_settings.mixer_type = MixerType::Fine;
+            block.mixer_settings.mixer_mode = MixerMode::RealToIq;
+            block.mixer_settings.freq = 500.0;
             block.decimation = DecimationFactor::X16;
         }
     }

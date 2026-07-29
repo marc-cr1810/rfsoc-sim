@@ -58,6 +58,10 @@ pub fn show_spectrum_view(
                 ui.separator();
                 ui.colored_label(Theme::ACCENT_WARN, "⚡ Overlay: RF Chain H(f)");
             }
+            if signal.overrange {
+                ui.separator();
+                ui.colored_label(Theme::ACCENT_ERROR, "⚠ OVR");
+            }
         });
         ui.separator();
 

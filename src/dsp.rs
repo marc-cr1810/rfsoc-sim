@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use crate::rfdc::{AdcBlock, AdcTile, CoarseMixFreq, MixerMode};
+use crate::rfdc::{AdcBlock, AdcTile, CoarseMixFreq, MixerType, MixerMode as RfdcMixerMode, FineMixerScale};
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::f64::consts::PI;
@@ -36,6 +36,8 @@ pub struct ProcessedSignal {
     pub output_sample_rate_mhz: f64,
     /// Complex baseband output time-domain samples (for oscilloscope & constellation).
     pub output_time_samples: Vec<Complex<f64>>,
+    /// True if the physical ADC waveform clipped at any point during this capture.
+    pub overrange: bool,
 }
 
 // ...
@@ -110,6 +112,16 @@ impl FftWindow {
             FftWindow::Rectangular => {}
         }
     }
+
+    pub fn coherent_gain(&self) -> f64 {
+        match self {
+            FftWindow::Hanning => 0.5,
+            FftWindow::Hamming => 0.54,
+            FftWindow::BlackmanHarris => 0.35875,
+            FftWindow::FlatTop => 0.21557895,
+            FftWindow::Rectangular => 1.0,
+        }
+    }
 }
 
 impl std::fmt::Display for FftWindow {
@@ -124,8 +136,9 @@ impl std::fmt::Display for FftWindow {
     }
 }
 
-/// Apply ADC hardware non-idealities (HD2/HD3 distortion, bit quantization, interleaving spurs).
-pub fn apply_adc_non_idealities(
+/// Apply analog hardware non-idealities (HD2/HD3 distortion) before sampling.
+/// Distortion is applied to the real voltage waveform.
+pub fn apply_analog_non_idealities(
     samples: &[Complex<f64>],
     non_idealities: &crate::rfdc::AdcNonIdealities,
 ) -> Vec<Complex<f64>> {
@@ -143,48 +156,91 @@ pub fn apply_adc_non_idealities(
     } else {
         0.0
     };
-    let spur_amp = if non_idealities.interleaving_spur_dbc < 0.0 {
+
+    samples
+        .iter()
+        .map(|&s| {
+            let mut v = s.re;
+            if a2 > 0.0 {
+                v += a2 * v * v;
+            }
+            if a3 > 0.0 {
+                v += a3 * v * v * v;
+            }
+            Complex::new(v, s.im) // keep im just in case, though it should be real
+        })
+        .collect()
+}
+
+/// Apply digital hardware non-idealities (Quantization, Clipping, Interleaving spurs) after sampling.
+/// Also returns a boolean indicating if clipping occurred (overrange).
+pub fn apply_digital_non_idealities(
+    samples: &[Complex<f64>],
+    non_idealities: &crate::rfdc::AdcNonIdealities,
+) -> (Vec<Complex<f64>>, bool) {
+    let mut overrange = false;
+
+    if samples.is_empty() {
+        return (Vec::new(), false);
+    }
+
+    let spur_amp = if non_idealities.enabled && non_idealities.interleaving_spur_dbc < 0.0 {
         10.0_f64.powf(non_idealities.interleaving_spur_dbc / 20.0)
     } else {
         0.0
     };
 
-    let q_levels = if non_idealities.quantization_bits > 0 && non_idealities.quantization_bits <= 24 {
+    let q_levels = if non_idealities.enabled && non_idealities.quantization_bits > 0 && non_idealities.quantization_bits <= 24 {
         (1u64 << non_idealities.quantization_bits) as f64
     } else {
         0.0
     };
 
-    samples
+    let max_val = 1.0; // Normalized +/- 1.0 full scale
+
+    let processed: Vec<Complex<f64>> = samples
         .iter()
         .enumerate()
         .map(|(i, &s)| {
-            let mut val = s;
-            // 1. Non-linear distortion (HD2, HD3)
-            if a2 > 0.0 {
-                let mag_sq = s.norm_sqr();
-                val += s * (a2 * mag_sq.sqrt());
-            }
-            if a3 > 0.0 {
-                val += s * (a3 * s.norm_sqr());
+            let mut v = s.re;
+
+            // 1. Interleaving mismatch spur (typically Fs/2 and Fs/4)
+            if spur_amp > 0.0 {
+                let sign_fs2 = if i % 2 == 0 { 1.0 } else { -1.0 };
+                let sign_fs4 = if i % 4 == 0 || i % 4 == 1 { 1.0 } else { -1.0 };
+                // Mismatch scales with input
+                v += v * spur_amp * (sign_fs2 + sign_fs4) * 0.5;
+                
+                // Offset spur (signal independent) at Fs/2
+                v += spur_amp * sign_fs2 * 0.1; 
             }
 
-            // 2. Interleaving mismatch spur (at Fs/8 boundary)
-            if spur_amp > 0.0 {
-                let phase = PI / 4.0 * i as f64;
-                val += Complex::new(spur_amp * phase.cos(), spur_amp * phase.sin());
+            // 2. Clipping
+            if v > max_val {
+                v = max_val;
+                overrange = true;
+            } else if v < -max_val {
+                v = -max_val;
+                overrange = true;
             }
 
             // 3. Bit resolution quantization
             if q_levels > 0.0 {
-                let re = (val.re * q_levels / 2.0).round() / (q_levels / 2.0);
-                let im = (val.im * q_levels / 2.0).round() / (q_levels / 2.0);
-                val = Complex::new(re, im);
+                let half_q = q_levels / 2.0;
+                let mut quant = (v * half_q).round();
+                if quant >= half_q {
+                    quant = half_q - 1.0;
+                } else if quant < -half_q {
+                    quant = -half_q;
+                }
+                v = quant / half_q;
             }
 
-            val
+            Complex::new(v, 0.0)
         })
-        .collect()
+        .collect();
+
+    (processed, overrange)
 }
 
 /// Process a signal through the full ADC block pipeline.
@@ -200,41 +256,76 @@ pub fn process_adc_block(
 ) -> ProcessedSignal {
     let fft_size = 2048;
     let fs_mhz = tile.sample_rate_mhz();
+    let ms = &block.mixer_settings;
 
-    // Apply ADC non-idealities to input samples
-    let adc_samples = apply_adc_non_idealities(input_samples, &block.non_idealities);
+    // 0. Apply DSA (Digital Step Attenuator) — reduces full-scale voltage before sampling
+    let dsa_scale = if block.dsa_db > 0.0 {
+        10.0_f64.powf(-block.dsa_db / 20.0)
+    } else {
+        1.0
+    };
+    let dsa_samples: Vec<Complex<f64>> = if dsa_scale < 1.0 {
+        input_samples.iter().map(|&s| s * dsa_scale).collect()
+    } else {
+        input_samples.to_vec()
+    };
 
-    // 1. Input spectrum (full wideband)
+    // 1. Apply analog non-idealities (HD2/HD3) to input samples (pre-sampling)
+    let analog_samples = apply_analog_non_idealities(&dsa_samples, &block.non_idealities);
+
+    // 2. Input spectrum (full wideband)
     let (input_spectrum, input_freq) =
-        compute_spectrum_positive(&adc_samples, fft_size, input_sample_rate_mhz);
+        compute_spectrum_positive(&analog_samples, fft_size, input_sample_rate_mhz);
 
     let raw_source_spectrum_dbfs = raw_source_samples.map(|samples| {
         let (raw_spec, _) = compute_spectrum_positive(samples, fft_size, input_sample_rate_mhz);
         raw_spec
     });
 
-    // 2. Sample wideband real physical voltage v(t) at the ADC tile sample rate Fs.
+    // 3. Sample wideband real physical voltage v(t) at the ADC tile sample rate Fs.
     // In hardware, track-and-hold ADC sampling folds ALL wideband Nyquist zones into 0..Fs/2.
-    let tile_samples = sample_adc_at_tile_rate(&adc_samples, input_sample_rate_mhz, fs_mhz);
+    let tile_samples_analog = sample_adc_at_tile_rate(&analog_samples, input_sample_rate_mhz, fs_mhz);
+
+    // 4. Apply digital non-idealities (Clipping, Quantization, Interleaving spurs)
+    let (tile_samples, overrange) = apply_digital_non_idealities(&tile_samples_analog, &block.non_idealities);
 
     // Folded spectrum: actual ADC digital output spectrum (0..Fs/2)
     let (folded_spectrum, folded_freq) =
         compute_spectrum_positive(&tile_samples, fft_size, fs_mhz);
 
-    let zone_idx = tile.nyquist_zone_index.max(1);
-    let is_even_zone = zone_idx % 2 == 0;
-    let nco_freq = if is_even_zone {
-        -block.nco_freq_mhz
-    } else {
-        block.nco_freq_mhz
+    let is_even_zone = block.nyquist_zone.is_even();
+    
+    // NCO Frequency Negation Rule (XRFdc Driver behavior):
+    // Only negate if |Freq| > Fs/2 AND we are in an EVEN zone.
+    let mut nco_freq = ms.freq;
+    if nco_freq.abs() > fs_mhz / 2.0 {
+        // Wrap to [-Fs/2, Fs/2]
+        nco_freq = (nco_freq + fs_mhz / 2.0).rem_euclid(fs_mhz) - fs_mhz / 2.0;
+        if is_even_zone && nco_freq != 0.0 {
+            nco_freq = -nco_freq;
+        }
+    }
+
+    // Determine FineMixerScale
+    let scale = match ms.fine_mixer_scale {
+        FineMixerScale::OnePointZero => 1.0,
+        FineMixerScale::ZeroPointSeven => 0.7071067811865476, // 1/√2
+        FineMixerScale::Auto => {
+            // XRFdc driver: R2C uses 1.0, C2C uses 0.7071, R2R uses 1.0
+            match ms.mixer_mode {
+                RfdcMixerMode::IqToIq => 0.7071067811865476,
+                _ => 1.0,
+            }
+        }
     };
 
     let mixed_samples = apply_mixer(
         &tile_samples,
-        block.mixer_mode,
+        &block.mixer_settings,
         nco_freq,
         fs_mhz,
         fs_mhz,
+        scale,
     );
 
     // 4. Compute post-mixer spectrum (at ADC tile rate Fs)
@@ -244,8 +335,11 @@ pub fn process_adc_block(
         compute_spectrum_positive(&mixed_samples, fft_size, fs_mhz)
     };
 
-    // 5. Apply DDC decimation filter at the ADC tile rate Fs
-    let decimated = apply_decimation(&mixed_samples, block.decimation.factor());
+    // 5. Apply QMC (Quadrature Modulation Correction) post-mixer, pre-decimation
+    let qmc_samples = apply_qmc(&mixed_samples, &block.qmc_settings);
+
+    // 6. Apply DDC decimation filter at the ADC tile rate Fs
+    let decimated = apply_decimation(&qmc_samples, block.decimation.factor());
     let actual_output_rate = block.output_rate_mhz(tile.sample_rate_gsps);
 
     // 6. Output spectrum
@@ -275,6 +369,7 @@ pub fn process_adc_block(
         output_freq_axis_mhz: output_freq,
         output_sample_rate_mhz: actual_output_rate,
         output_time_samples: decimated,
+        overrange,
     }
 }
 
@@ -300,8 +395,8 @@ pub fn compute_spectrum_with_window(
         fft.process(&mut buffer);
     });
 
-    // Compute magnitude in dBFS (normalised to FFT size)
-    let norm = 1.0 / n as f64;
+    // Compute magnitude in dBFS (normalised to FFT size and window coherent gain)
+    let norm = 1.0 / (n as f64 * window.coherent_gain());
     let spectrum_dbfs: Vec<f64> = buffer
         .iter()
         .map(|c| {
@@ -354,14 +449,19 @@ pub fn compute_spectrum_positive_with_window(
         fft.process(&mut buffer);
     });
 
-    let norm = 1.0 / n as f64;
+    let norm = 1.0 / (n as f64 * window.coherent_gain());
     let half = n / 2;
 
     // Take only positive frequencies (0..Fs/2)
     let spectrum_dbfs: Vec<f64> = buffer[..=half]
         .iter()
-        .map(|c| {
-            let mag = c.norm() * norm;
+        .enumerate()
+        .map(|(i, c)| {
+            let mut mag = c.norm() * norm;
+            // Scale positive frequencies by 2 (except DC and Nyquist) to account for folded negative energy
+            if i > 0 && i < half {
+                mag *= 2.0;
+            }
             20.0 * mag.max(1e-15).log10()
         })
         .collect();
@@ -530,90 +630,86 @@ pub fn sample_adc_at_tile_rate(
     sampled
 }
 
+/// Apply Quadrature Modulation Correction (QMC) to complex samples.
+///
+/// This models the XRFdc QMC block which corrects I/Q gain imbalance,
+/// phase skew, and DC offset post-mixer.
+pub fn apply_qmc(
+    samples: &[Complex<f64>],
+    qmc: &crate::rfdc::QmcSettings,
+) -> Vec<Complex<f64>> {
+    // No-op passthrough when settings are at defaults
+    if (qmc.gain - 1.0).abs() < 1e-12 && qmc.phase.abs() < 1e-12 && qmc.offset.abs() < 1e-12 {
+        return samples.to_vec();
+    }
+
+    let phase_rad = qmc.phase * PI / 180.0;
+    let cos_p = phase_rad.cos();
+    let sin_p = phase_rad.sin();
+    let g = qmc.gain;
+
+    samples
+        .iter()
+        .map(|&s| {
+            let i_out = g * (s.re * cos_p - s.im * sin_p) + qmc.offset;
+            let q_out = g * (s.re * sin_p + s.im * cos_p);
+            Complex::new(i_out, q_out)
+        })
+        .collect()
+}
+
 /// Apply the DDC mixer to time-domain samples.
 ///
 /// `samples`: complex input samples
-/// `mode`: MixerMode (Bypass, CoarseMix, or FineMix)
-/// `nco_freq_mhz`: fine NCO frequency in MHz
+/// `settings`: MixerSettings from the block configuration
+/// `nco_freq_mhz`: resolved NCO frequency in MHz (after zone wrap/flip)
 /// `sim_fs_mhz`: sampling rate of input samples in MHz (wideband simulation rate)
 /// `tile_fs_mhz`: ADC tile sampling rate in MHz
+/// `scale`: FineMixerScale factor (1.0 or 0.7071)
 pub fn apply_mixer(
     samples: &[Complex<f64>],
-    mode: MixerMode,
+    settings: &crate::rfdc::MixerSettings,
     nco_freq_mhz: f64,
     sim_fs_mhz: f64,
     tile_fs_mhz: f64,
+    scale: f64,
 ) -> Vec<Complex<f64>> {
-    match mode {
-        MixerMode::Bypass => samples.to_vec(),
-        MixerMode::CoarseMix(coarse) => {
-            let coarse_shift_mhz = match coarse {
+    match settings.mixer_type {
+        MixerType::Off => samples.to_vec(),
+        MixerType::Coarse => {
+            let coarse_shift_mhz = match settings.coarse_mix_freq {
                 CoarseMixFreq::FsOver4 => 0.25 * tile_fs_mhz,
                 CoarseMixFreq::MinusFsOver4 => -0.25 * tile_fs_mhz,
                 CoarseMixFreq::FsOver2 => 0.5 * tile_fs_mhz,
+                CoarseMixFreq::Bypass | CoarseMixFreq::Off => 0.0,
             };
-            let omega = -2.0 * PI * coarse_shift_mhz / sim_fs_mhz; // negative for downconversion
+            if coarse_shift_mhz.abs() < 1e-12 {
+                return samples.to_vec();
+            }
+            let omega = -2.0 * PI * coarse_shift_mhz / sim_fs_mhz;
             samples
                 .iter()
                 .enumerate()
                 .map(|(i, &s)| {
                     let angle = omega * i as f64;
-                    s * Complex::new(angle.cos(), angle.sin())
+                    s * Complex::new(angle.cos(), angle.sin()) * scale
                 })
                 .collect()
         }
-        MixerMode::FineMix => {
+        MixerType::Fine => {
             let omega = -2.0 * PI * nco_freq_mhz / sim_fs_mhz;
-            // Check if input is a real-valued physical ADC signal (s.im == 0)
-            let is_real_signal = samples.iter().take(50).all(|s| s.im.abs() < 1e-12);
-
-            let input_signal = if is_real_signal {
-                hilbert_transform(samples)
-            } else {
-                samples.to_vec()
-            };
-
-            input_signal
+            // Real R2C quadrature mixing: I = x[n]·cos(ωn), Q = -x[n]·sin(ωn) for a real input,
+            // which maps perfectly to multiplying the complex sample (where im=0) by Complex::new(cos, sin).
+            samples
                 .iter()
                 .enumerate()
                 .map(|(i, &s)| {
                     let angle = omega * i as f64;
-                    s * Complex::new(angle.cos(), angle.sin())
+                    s * Complex::new(angle.cos(), angle.sin()) * scale
                 })
                 .collect()
         }
     }
-}
-
-/// Create an analytic complex signal from real voltage samples using a 31-tap Hilbert transformer FIR filter.
-/// Suppresses negative image frequencies by >80 dB for real-to-complex DDC mixing.
-pub fn hilbert_transform(real_samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
-    let n = real_samples.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let num_taps = 31isize;
-    let half_taps = num_taps / 2;
-    let mut analytic = Vec::with_capacity(n);
-
-    for i in 0..n as isize {
-        let mut q_val = 0.0;
-        for k in -half_taps..=half_taps {
-            if k % 2 != 0 {
-                let idx = i - k;
-                if idx >= 0 && idx < n as isize {
-                    let h_k = 2.0 / (PI * k as f64);
-                    let norm_k = (k + half_taps) as f64 / num_taps as f64;
-                    let w = 0.42 - 0.5 * (2.0 * PI * norm_k).cos() + 0.08 * (4.0 * PI * norm_k).cos();
-                    q_val += real_samples[idx as usize].re * h_k * w;
-                }
-            }
-        }
-        let i_val = real_samples[i as usize].re;
-        analytic.push(Complex::new(i_val, q_val));
-    }
-
-    analytic
 }
 
 /// Apply decimation using anti-aliasing FIR windowed-sinc filtering before downsampling.
@@ -753,7 +849,16 @@ mod tests {
             })
             .collect();
 
-        let mixed = apply_mixer(&samples, MixerMode::CoarseMix(CoarseMixFreq::FsOver4), 0.0, fs, fs);
+        let coarse_ms = crate::rfdc::MixerSettings {
+            mixer_type: crate::rfdc::MixerType::Coarse,
+            mixer_mode: crate::rfdc::MixerMode::RealToIq,
+            coarse_mix_freq: CoarseMixFreq::FsOver4,
+            freq: 0.0,
+            phase_offset: 0.0,
+            fine_mixer_scale: crate::rfdc::FineMixerScale::Auto,
+            event_source: crate::rfdc::EventSource::Tile,
+        };
+        let mixed = apply_mixer(&samples, &coarse_ms, 0.0, fs, fs, 1.0);
         assert_eq!(mixed.len(), n);
 
         // After mixing with -Fs/4, a tone at Fs/4 should move to ~DC
@@ -788,7 +893,16 @@ mod tests {
             .collect();
 
         // Apply CoarseMix Fs/4 (should downshift by tile_fs/4 = 1000 MHz)
-        let mixed = apply_mixer(&samples, MixerMode::CoarseMix(CoarseMixFreq::FsOver4), 0.0, sim_fs, tile_fs);
+        let coarse_ms = crate::rfdc::MixerSettings {
+            mixer_type: crate::rfdc::MixerType::Coarse,
+            mixer_mode: crate::rfdc::MixerMode::RealToIq,
+            coarse_mix_freq: CoarseMixFreq::FsOver4,
+            freq: 0.0,
+            phase_offset: 0.0,
+            fine_mixer_scale: crate::rfdc::FineMixerScale::Auto,
+            event_source: crate::rfdc::EventSource::Tile,
+        };
+        let mixed = apply_mixer(&samples, &coarse_ms, 0.0, sim_fs, tile_fs, 1.0);
 
         let (spectrum, freq_axis) = compute_spectrum_positive(&mixed, n, sim_fs);
         let (peak_idx, _) = spectrum
@@ -844,7 +958,7 @@ mod tests {
         let samples: Vec<Complex<f64>> = (0..512)
             .map(|i| {
                 let phi = 2.0 * PI * 0.1 * i as f64;
-                Complex::new(phi.cos(), phi.sin())
+                Complex::new(phi.cos(), 0.0) // Real voltage
             })
             .collect();
 
@@ -853,7 +967,7 @@ mod tests {
         non.hd2_dbc = -30.0;
         non.hd3_dbc = -40.0;
 
-        let distorted = apply_adc_non_idealities(&samples, &non);
+        let distorted = apply_analog_non_idealities(&samples, &non);
         assert_eq!(distorted.len(), samples.len());
         // Distorted samples should differ from pure sine
         let diff: f64 = samples.iter().zip(distorted.iter()).map(|(a, b)| (a - b).norm()).sum();
@@ -862,7 +976,7 @@ mod tests {
 
     #[test]
     fn process_adc_block_auto_tuned_higher_zone() {
-        use crate::rfdc::{AdcTile, MixerMode};
+        use crate::rfdc::{AdcTile, MixerType, MixerMode};
         use crate::signal::{SignalGenerator, Tone, ToneModulation};
 
         // Recreate user scenario: Fs = 1.96608 GSPS (1966.08 MHz), Target = 2400 MHz (Zone 3)
@@ -870,11 +984,12 @@ mod tests {
         tile.sample_rate_gsps = 1.96608;
 
         let auto_res = tile.auto_tune(2400.0);
-        tile.nyquist_zone = auto_res.nyquist_zone;
-        tile.nyquist_zone_index = auto_res.zone_index;
+        tile.blocks[0].nyquist_zone = auto_res.nyquist_zone;
+        tile.blocks[0].planner_zone = auto_res.zone_index;
 
-        tile.blocks[0].mixer_mode = MixerMode::FineMix;
-        tile.blocks[0].nco_freq_mhz = auto_res.nco_freq_mhz;
+        tile.blocks[0].mixer_settings.mixer_type = MixerType::Fine;
+        tile.blocks[0].mixer_settings.mixer_mode = MixerMode::RealToIq;
+        tile.blocks[0].mixer_settings.freq = auto_res.nco_freq_mhz;
 
         let block = tile.blocks[0].clone();
 
@@ -908,24 +1023,25 @@ mod tests {
         );
         assert!(
             (peaks[0].mag_dbfs - (-12.0)).abs() < 3.0,
-            "Peak magnitude should be close to -12 dBFS for analytic complex DDC, got {:.1} dBFS",
+            "Peak magnitude should be close to -12 dBFS due to 6 dB drop from real-to-complex quadrature mixing, got {:.1} dBFS",
             peaks[0].mag_dbfs
         );
     }
 
     #[test]
     fn other_nyquist_zone_interferes_if_unfiltered() {
-        use crate::rfdc::{AdcTile, MixerMode};
+        use crate::rfdc::{AdcTile, MixerType, MixerMode};
         use crate::signal::{SignalGenerator, Tone, ToneModulation};
 
         let mut tile = AdcTile::new(0);
         tile.sample_rate_gsps = 1.96608;
 
         let auto_res = tile.auto_tune(2400.0);
-        tile.nyquist_zone = auto_res.nyquist_zone;
-        tile.nyquist_zone_index = auto_res.zone_index;
-        tile.blocks[0].mixer_mode = MixerMode::FineMix;
-        tile.blocks[0].nco_freq_mhz = auto_res.nco_freq_mhz;
+        tile.blocks[0].nyquist_zone = auto_res.nyquist_zone;
+        tile.blocks[0].planner_zone = auto_res.zone_index;
+        tile.blocks[0].mixer_settings.mixer_type = MixerType::Fine;
+        tile.blocks[0].mixer_settings.mixer_mode = MixerMode::RealToIq;
+        tile.blocks[0].mixer_settings.freq = auto_res.nco_freq_mhz;
 
         let mut sig_gen = SignalGenerator::default();
         sig_gen.tones = vec![
@@ -958,5 +1074,215 @@ mod tests {
 
         assert!(!peaks.is_empty());
         assert!(peaks[0].freq_mhz.abs() < 10.0, "Both signals construct peak at 0 Hz baseband");
+    }
+
+    #[test]
+    fn clipping_overrange_flag() {
+        let samples: Vec<Complex<f64>> = vec![Complex::new(1.5, 0.0), Complex::new(-1.5, 0.0), Complex::new(0.5, 0.0)];
+        let non = crate::rfdc::AdcNonIdealities::default(); // default has enabled=false for spur/quant, but clip still applies
+        let (processed, overrange) = apply_digital_non_idealities(&samples, &non);
+        
+        assert!(overrange);
+        assert_eq!(processed[0].re, 1.0);
+        assert_eq!(processed[1].re, -1.0);
+        assert_eq!(processed[2].re, 0.5);
+    }
+
+    #[test]
+    fn r2c_mixer_image_generation() {
+        let sim_fs = 1000.0;
+        let tile_fs = 1000.0;
+        let n = 256;
+        let f_in = 100.0;
+        
+        let samples: Vec<Complex<f64>> = (0..n)
+            .map(|i| {
+                let phi = 2.0 * PI * f_in * i as f64 / sim_fs;
+                Complex::new(phi.cos(), 0.0) // Real tone
+            })
+            .collect();
+            
+        // Mix with 100 MHz NCO (shifts signal down by 100 MHz)
+        let ms = crate::rfdc::MixerSettings {
+            mixer_type: crate::rfdc::MixerType::Fine,
+            mixer_mode: crate::rfdc::MixerMode::RealToIq,
+            coarse_mix_freq: crate::rfdc::CoarseMixFreq::Off,
+            freq: 100.0,
+            phase_offset: 0.0,
+            fine_mixer_scale: crate::rfdc::FineMixerScale::Auto,
+            event_source: crate::rfdc::EventSource::Tile,
+        };
+        let mixed = apply_mixer(&samples, &ms, 100.0, sim_fs, tile_fs, 1.0);
+        
+        // We should have energy at DC (100 - 100 = 0) AND at -200 MHz (-100 - 100 = -200)
+        let (spectrum, _freq) = compute_spectrum(&mixed, n, sim_fs);
+        
+        // Find DC and -200 MHz bins
+        let dc_idx = n / 2;
+        let image_idx = n / 2 - (200.0 / sim_fs * n as f64) as usize;
+        
+        assert!(spectrum[dc_idx] > -20.0, "Missing DC component from mixing");
+        assert!(spectrum[image_idx] > -20.0, "Missing -2w image from real-to-complex mixing");
+    }
+
+    #[test]
+    fn qmc_gain_offset() {
+        let qmc = crate::rfdc::QmcSettings { gain: 2.0, phase: 0.0, offset: 0.5 };
+        let samples = vec![Complex::new(1.0, 0.0), Complex::new(0.0, 1.0)];
+        let result = apply_qmc(&samples, &qmc);
+
+        // s[0]: I=1, Q=0 → I_out = 2*1 + 0.5 = 2.5, Q_out = 2*0 = 0
+        assert!((result[0].re - 2.5).abs() < 1e-9);
+        assert!(result[0].im.abs() < 1e-9);
+
+        // s[1]: I=0, Q=1 → I_out = 2*(-1·0) + 0.5 = 2*0 + 0.5 = -1.5, wait:
+        // I_out = gain * (I*cos(0) - Q*sin(0)) + offset = 2*(0 - 0) + 0.5 = 0.5
+        // Q_out = gain * (I*sin(0) + Q*cos(0)) = 2*(0 + 1) = 2.0
+        assert!((result[1].re - 0.5).abs() < 1e-9);
+        assert!((result[1].im - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn qmc_phase_rotation() {
+        // 90° rotation: cos(90°)=0, sin(90°)=1
+        let qmc = crate::rfdc::QmcSettings { gain: 1.0, phase: 90.0, offset: 0.0 };
+        let samples = vec![Complex::new(1.0, 0.0)];
+        let result = apply_qmc(&samples, &qmc);
+
+        // I_out = 1*(1*cos(90°) - 0*sin(90°)) = 1*(0) = 0
+        // Q_out = 1*(1*sin(90°) + 0*cos(90°)) = 1*(1) = 1
+        assert!(result[0].re.abs() < 1e-9, "90° QMC should zero I, got {}", result[0].re);
+        assert!((result[0].im - 1.0).abs() < 1e-9, "90° QMC should put full signal in Q, got {}", result[0].im);
+    }
+
+    #[test]
+    fn dsa_attenuation() {
+        use crate::rfdc::{AdcTile, MixerType};
+
+        let mut tile = AdcTile::new(0);
+        tile.sample_rate_gsps = 4.0;
+
+        // Block with 6 dB DSA (should halve voltage → -6 dB)
+        let mut block = tile.blocks[0].clone();
+        block.dsa_db = 6.0;
+        block.mixer_settings.mixer_type = MixerType::Off;
+
+        let samples: Vec<Complex<f64>> = (0..512)
+            .map(|i| {
+                let phi = 2.0 * PI * 100.0 * i as f64 / 15000.0;
+                Complex::new(phi.cos() * 0.5, 0.0) // 0.5 amplitude
+            })
+            .collect();
+
+        let processed = process_adc_block(&samples, 15000.0, &block, &tile, None, None);
+
+        // With DSA, the output peak should be ~6 dB lower than without DSA
+        let mut block_no_dsa = block.clone();
+        block_no_dsa.dsa_db = 0.0;
+        let processed_no_dsa = process_adc_block(&samples, 15000.0, &block_no_dsa, &tile, None, None);
+
+        let peak_with_dsa = processed.folded_spectrum_dbfs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let peak_no_dsa = processed_no_dsa.folded_spectrum_dbfs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        let delta = peak_no_dsa - peak_with_dsa;
+        assert!(
+            (delta - 6.0).abs() < 1.5,
+            "6 dB DSA should reduce signal by ~6 dB, got delta = {:.1} dB",
+            delta
+        );
+    }
+
+    #[test]
+    fn fine_mixer_scale_auto_r2c_vs_c2c() {
+        use crate::rfdc::{MixerSettings, MixerType, FineMixerScale, EventSource, CoarseMixFreq};
+        use crate::rfdc::MixerMode as MM;
+
+        let n = 256;
+        let fs = 1000.0;
+        let samples: Vec<Complex<f64>> = (0..n)
+            .map(|i| {
+                let phi = 2.0 * PI * 100.0 * i as f64 / fs;
+                Complex::new(phi.cos(), 0.0)
+            })
+            .collect();
+
+        let ms_r2c = MixerSettings {
+            mixer_type: MixerType::Fine, mixer_mode: MM::RealToIq,
+            coarse_mix_freq: CoarseMixFreq::Off, freq: 100.0, phase_offset: 0.0,
+            fine_mixer_scale: FineMixerScale::Auto, event_source: EventSource::Tile,
+        };
+        let ms_c2c = MixerSettings {
+            mixer_type: MixerType::Fine, mixer_mode: MM::IqToIq,
+            coarse_mix_freq: CoarseMixFreq::Off, freq: 100.0, phase_offset: 0.0,
+            fine_mixer_scale: FineMixerScale::Auto, event_source: EventSource::Tile,
+        };
+
+        // Auto scale for R2C should be 1.0
+        let scale_r2c = match ms_r2c.fine_mixer_scale {
+            FineMixerScale::Auto => match ms_r2c.mixer_mode { MM::IqToIq => 0.7071067811865476, _ => 1.0 },
+            _ => 1.0,
+        };
+        // Auto scale for C2C should be 0.7071
+        let scale_c2c = match ms_c2c.fine_mixer_scale {
+            FineMixerScale::Auto => match ms_c2c.mixer_mode { MM::IqToIq => 0.7071067811865476, _ => 1.0 },
+            _ => 1.0,
+        };
+
+        let mixed_r2c = apply_mixer(&samples, &ms_r2c, 100.0, fs, fs, scale_r2c);
+        let mixed_c2c = apply_mixer(&samples, &ms_c2c, 100.0, fs, fs, scale_c2c);
+
+        // C2C should have ~3 dB less power than R2C due to 0.7071 scaling
+        let power_r2c: f64 = mixed_r2c.iter().map(|s| s.norm_sqr()).sum::<f64>() / n as f64;
+        let power_c2c: f64 = mixed_c2c.iter().map(|s| s.norm_sqr()).sum::<f64>() / n as f64;
+        let ratio_db = 10.0 * (power_r2c / power_c2c).log10();
+
+        assert!(
+            (ratio_db - 3.0).abs() < 0.5,
+            "R2C/C2C power ratio should be ~3 dB, got {:.1} dB",
+            ratio_db
+        );
+    }
+
+    #[test]
+    fn dbfs_calibration() {
+        let n = 2048;
+        let fs = 1024.0; // Use power of 2 so f=100 lands on exact bin 200 (avoids scalloping loss)
+        
+        // Full scale complex tone (amplitude 1.0)
+        let samples: Vec<Complex<f64>> = (0..n)
+            .map(|i| {
+                let phi = 2.0 * PI * 100.0 * i as f64 / fs;
+                Complex::new(phi.cos(), phi.sin())
+            })
+            .collect();
+            
+        let (spectrum, _) = compute_spectrum(&samples, n, fs);
+        let peak_dbfs = spectrum.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        
+        // Peak should be 0.0 dBFS for a full scale complex tone
+        assert!(
+            peak_dbfs.abs() < 0.1,
+            "Full scale complex tone should be 0 dBFS, got {:.2} dBFS",
+            peak_dbfs
+        );
+
+        // Full scale real tone (amplitude 1.0)
+        let samples_real: Vec<Complex<f64>> = (0..n)
+            .map(|i| {
+                let phi = 2.0 * PI * 100.0 * i as f64 / fs;
+                Complex::new(phi.cos(), 0.0)
+            })
+            .collect();
+
+        // One-sided positive spectrum
+        let (spectrum_pos, _) = compute_spectrum_positive_with_window(&samples_real, n, fs, FftWindow::Hanning);
+        let peak_pos_dbfs = spectrum_pos.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        
+        // Peak should be 0.0 dBFS for a full scale real tone in a one-sided spectrum
+        assert!(
+            peak_pos_dbfs.abs() < 0.1,
+            "Full scale real tone should be 0 dBFS in one-sided spectrum, got {:.2} dBFS",
+            peak_pos_dbfs
+        );
     }
 }

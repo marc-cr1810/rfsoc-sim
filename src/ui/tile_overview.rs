@@ -53,10 +53,11 @@ pub fn show_tile_overview(
                     ui.colored_label(Theme::TEXT_SECONDARY, "—");
                 }
 
-                // Nyquist zone
+                // Nyquist zone (show from block 0 as representative)
                 if tile.enabled {
-                    let zone_color = Theme::zone_color(tile.nyquist_zone.index() as usize);
-                    ui.colored_label(zone_color, tile.nyquist_zone.to_string());
+                    let b0 = &tile.blocks[0];
+                    let zone_color = Theme::zone_color(b0.planner_zone as usize);
+                    ui.colored_label(zone_color, b0.nyquist_zone.to_string());
                 } else {
                     ui.colored_label(Theme::TEXT_SECONDARY, "—");
                 }
@@ -65,7 +66,7 @@ pub fn show_tile_overview(
                 if tile.enabled {
                     let b = &tile.blocks[0];
                     let block_text = if b.enabled {
-                        format!("{} | {}", b.mixer_mode, b.decimation)
+                        format!("{} | {}", b.mixer_settings.mixer_type, b.decimation)
                     } else {
                         "Disabled".to_string()
                     };
@@ -86,7 +87,7 @@ pub fn show_tile_overview(
                 if tile.enabled {
                     let b = &tile.blocks[1];
                     let block_text = if b.enabled {
-                        format!("{} | {}", b.mixer_mode, b.decimation)
+                        format!("{} | {}", b.mixer_settings.mixer_type, b.decimation)
                     } else {
                         "Disabled".to_string()
                     };

@@ -81,8 +81,18 @@ impl RfSocSimApp {
             return;
         }
 
-        // Evaluate input signal & cumulative transfer function from graph
-        let num_samples = 4096;
+        // Compute maximum decimation to ensure output FFT is not starved of samples
+        let mut max_decim = 1;
+        for t in &self.rfdc.adc_tiles {
+            if t.enabled {
+                for b in &t.blocks {
+                    if b.enabled {
+                        max_decim = max_decim.max(b.decimation.factor());
+                    }
+                }
+            }
+        }
+        let num_samples = (2048 * max_decim as usize).clamp(4096, 65536);
         let input_sample_rate_mhz = 15000.0; // 15 GHz wideband to support signals up to 7.5 GHz
 
         let graph_res = crate::node_graph::nodes::evaluate_graph(
@@ -433,13 +443,14 @@ impl eframe::App for RfSocSimApp {
                     ui.add_space(16.0);
 
                     let tile = &self.rfdc.adc_tiles[self.selected_tile];
+                    let block = &tile.blocks[self.selected_block];
                     let nyquist_bw = tile.sample_rate_mhz() / 2.0;
                     let num_zones = (15000.0 / nyquist_bw).ceil() as usize;
                     nyquist_view::show_nyquist_view(
                         ui,
                         tile.sample_rate_mhz(),
                         num_zones,
-                        tile.nyquist_zone_index as usize,
+                        block.planner_zone as usize,
                     );
                 });
             }

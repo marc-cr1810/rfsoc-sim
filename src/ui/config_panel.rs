@@ -45,52 +45,45 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
     ui.separator();
     ui.label("Tile Configuration");
 
-    // Sample rate
+    // Sample rate & PLL
     ui.horizontal(|ui| {
         ui.label("Sample Rate:");
         ui.add(
             egui::DragValue::new(&mut tile.sample_rate_gsps)
-                .range(0.5..=5.0)
+                .range(0.5..=10.0)
                 .suffix(" GSPS")
                 .speed(0.1),
         );
     });
 
-    ui.label(format!("Nyquist BW: {:.0} MHz", tile.nyquist_bw_mhz()));
-
-    // Nyquist zone
     ui.horizontal(|ui| {
-        ui.label("Nyquist Zone:");
-        egui::ComboBox::from_id_salt(format!("nyquist_zone_{}", tile.index))
-            .selected_text(tile.nyquist_zone.to_string())
-            .show_ui(ui, |ui| {
-                for zone_idx in 1..=16 {
-                    let zone = NyquistZone(zone_idx);
-                    if ui.selectable_value(&mut tile.nyquist_zone, zone, zone.to_string()).clicked() {
-                        tile.nyquist_zone_index = zone.index();
-                    }
-                }
-            });
-    });
-
-    // PLL
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut tile.pll_enabled, "PLL Enabled");
+        ui.checkbox(&mut tile.pll_enabled, "Internal PLL");
         if tile.pll_enabled {
             ui.add(
                 egui::DragValue::new(&mut tile.ref_clk_mhz)
                     .range(10.0..=1000.0)
-                    .suffix(" MHz")
+                    .suffix(" MHz Ref")
                     .speed(1.0),
             );
         }
     });
 
+    if let Some(err) = tile.validate_pll() {
+        ui.colored_label(Theme::ACCENT_ERROR, err);
+    } else if tile.pll_enabled {
+        let mult = tile.sample_rate_mhz() / tile.ref_clk_mhz;
+        ui.colored_label(Theme::TEXT_SECONDARY, format!("PLL Multiplier: {:.2}x", mult));
+    }
+
+    ui.label(format!("Nyquist BW: {:.0} MHz", tile.nyquist_bw_mhz()));
+
+
+
     ui.separator();
 
     let selected_block_idx = *selected_block;
     let tile_fs = tile.sample_rate_gsps;
-    let mut apply_auto_tune: Option<AutoTuneResult> = None;
+
 
     // Block selector
     ui.horizontal(|ui| {
@@ -119,34 +112,111 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
     ui.separator();
     ui.label("DDC Configuration");
 
-    // Mixer mode
+    let errors = block.validate(tile_fs * 1000.0);
+    if !errors.is_empty() {
+        ui.group(|ui| {
+            ui.colored_label(Theme::ACCENT_ERROR, "Hardware Configuration Errors:");
+            for err in errors {
+                ui.colored_label(Theme::ACCENT_ERROR, format!("• {}", err));
+            }
+        });
+        ui.separator();
+    }
+
+    // Nyquist zone
     ui.horizontal(|ui| {
-        ui.label("Mixer:");
-        egui::ComboBox::from_id_salt("mixer_mode")
-            .selected_text(block.mixer_mode.to_string())
+        ui.label("Planner Zone:");
+        egui::ComboBox::from_id_salt(format!("nyquist_zone_b{}", block.index))
+            .selected_text(format!("Zone {}", block.planner_zone))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut block.mixer_mode, MixerMode::Bypass, "Bypass");
-                for freq in CoarseMixFreq::ALL {
-                    ui.selectable_value(
-                        &mut block.mixer_mode,
-                        MixerMode::CoarseMix(freq),
-                        format!("Coarse ({})", freq),
-                    );
+                for zone_idx in 1..=16 {
+                    if ui.selectable_value(&mut block.planner_zone, zone_idx, format!("Zone {}", zone_idx)).clicked() {
+                        block.nyquist_zone = if zone_idx % 2 == 0 { NyquistZone::Even } else { NyquistZone::Odd };
+                    }
                 }
-                ui.selectable_value(&mut block.mixer_mode, MixerMode::FineMix, "Fine (NCO)");
+            });
+    });
+    ui.label(format!("Hardware Zone: {}", block.nyquist_zone));
+
+    // DSA Attenuation
+    ui.horizontal(|ui| {
+        ui.label("DSA Attn:");
+        ui.add(
+            egui::DragValue::new(&mut block.dsa_db)
+                .range(0.0..=27.0)
+                .suffix(" dB")
+                .speed(1.0),
+        );
+    });
+
+    // Mixer Type & Mode
+    ui.horizontal(|ui| {
+        ui.label("Mixer Type:");
+        egui::ComboBox::from_id_salt("mixer_type")
+            .selected_text(block.mixer_settings.mixer_type.to_string())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut block.mixer_settings.mixer_type, MixerType::Off, "Off");
+                ui.selectable_value(&mut block.mixer_settings.mixer_type, MixerType::Coarse, "Coarse");
+                ui.selectable_value(&mut block.mixer_settings.mixer_type, MixerType::Fine, "Fine");
             });
     });
 
-    // NCO frequency (only when fine mix is active)
-    if matches!(block.mixer_mode, MixerMode::FineMix) {
+    if block.mixer_settings.mixer_type != MixerType::Off {
         ui.horizontal(|ui| {
-            ui.label("NCO Freq:");
-            ui.add(
-                egui::DragValue::new(&mut block.nco_freq_mhz)
-                    .range(-tile_fs * 1000.0 / 2.0..=tile_fs * 1000.0 / 2.0)
-                    .suffix(" MHz")
-                    .speed(10.0),
-            );
+            ui.label("Mixer Mode:");
+            egui::ComboBox::from_id_salt("mixer_mode")
+                .selected_text(block.mixer_settings.mixer_mode.to_string())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut block.mixer_settings.mixer_mode, MixerMode::RealToReal, "Real -> Real");
+                    ui.selectable_value(&mut block.mixer_settings.mixer_mode, MixerMode::RealToIq, "Real -> I/Q");
+                    ui.selectable_value(&mut block.mixer_settings.mixer_mode, MixerMode::IqToIq, "I/Q -> I/Q");
+                    ui.selectable_value(&mut block.mixer_settings.mixer_mode, MixerMode::ComplexToReal, "I/Q -> Real");
+                });
+        });
+
+        if block.mixer_settings.mixer_type == MixerType::Coarse {
+            ui.horizontal(|ui| {
+                ui.label("Coarse Freq:");
+                egui::ComboBox::from_id_salt("coarse_mix_freq")
+                    .selected_text(block.mixer_settings.coarse_mix_freq.to_string())
+                    .show_ui(ui, |ui| {
+                        for freq in CoarseMixFreq::ALL {
+                            ui.selectable_value(&mut block.mixer_settings.coarse_mix_freq, freq, freq.to_string());
+                        }
+                    });
+            });
+        }
+
+        if block.mixer_settings.mixer_type == MixerType::Fine {
+            ui.horizontal(|ui| {
+                ui.label("NCO Freq:");
+                ui.add(
+                    egui::DragValue::new(&mut block.mixer_settings.freq)
+                        .range(-tile_fs * 1000.0 / 2.0..=tile_fs * 1000.0 / 2.0)
+                        .suffix(" MHz")
+                        .speed(10.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("NCO Phase:");
+                ui.add(
+                    egui::DragValue::new(&mut block.mixer_settings.phase_offset)
+                        .range(-180.0..=180.0)
+                        .suffix(" °")
+                        .speed(1.0),
+                );
+            });
+        }
+        
+        ui.horizontal(|ui| {
+            ui.label("Mixer Scale:");
+            egui::ComboBox::from_id_salt("mixer_scale")
+                .selected_text(block.mixer_settings.fine_mixer_scale.to_string())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut block.mixer_settings.fine_mixer_scale, FineMixerScale::Auto, "Auto");
+                    ui.selectable_value(&mut block.mixer_settings.fine_mixer_scale, FineMixerScale::OnePointZero, "1.0");
+                    ui.selectable_value(&mut block.mixer_settings.fine_mixer_scale, FineMixerScale::ZeroPointSeven, "0.7");
+                });
         });
     }
 
@@ -165,11 +235,38 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
     let output_rate = block.output_rate_mhz(tile_fs);
     ui.label(format!("Output Rate: {:.1} MHz", output_rate));
 
+    ui.horizontal(|ui| {
+        ui.label("AXI Words/Clk:");
+        egui::ComboBox::from_id_salt("axi_words")
+            .selected_text(block.axi_words_per_clock.to_string())
+            .show_ui(ui, |ui| {
+                for &words in &[1, 2, 4, 8, 16] {
+                    ui.selectable_value(&mut block.axi_words_per_clock, words, words.to_string());
+                }
+            });
+    });
+
     // Calibration mode
     ui.horizontal(|ui| {
         ui.label("Cal Mode:");
         ui.selectable_value(&mut block.calibration_mode, CalibrationMode::Mode1, "Mode 1");
         ui.selectable_value(&mut block.calibration_mode, CalibrationMode::Mode2, "Mode 2");
+    });
+
+    ui.separator();
+    ui.collapsing("⚖ QMC Settings", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Gain:");
+            ui.add(egui::DragValue::new(&mut block.qmc_settings.gain).speed(0.01));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Phase:");
+            ui.add(egui::DragValue::new(&mut block.qmc_settings.phase).suffix(" °").speed(0.1));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Offset:");
+            ui.add(egui::DragValue::new(&mut block.qmc_settings.offset).speed(1.0));
+        });
     });
 
     ui.separator();
@@ -251,7 +348,7 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
             d.insert_temp(egui::Id::new("auto_tune_target_freq"), target_freq);
         });
 
-        // Compute auto-tune using sample rate from tile_fs
+        // Preview auto-tune result using tile sample rate
         let temp_tile = AdcTile {
             sample_rate_gsps: tile_fs,
             ..AdcTile::new(0)
@@ -284,14 +381,7 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
         });
 
         if ui.button("⚡ Apply SDR Nyquist Zone & NCO").clicked() {
-            block.mixer_mode = MixerMode::FineMix;
-            block.nco_freq_mhz = res.nco_freq_mhz;
-            apply_auto_tune = Some(res);
+            block.auto_tune(tile_fs, target_freq);
         }
     });
-
-    if let Some(res) = apply_auto_tune {
-        tile.nyquist_zone = res.nyquist_zone;
-        tile.nyquist_zone_index = res.zone_index;
-    }
 }
