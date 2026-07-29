@@ -516,6 +516,15 @@ impl SnarlViewer<RfNode> for RfNodeViewer {
             ui.close();
         }
     }
+
+    fn connect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<RfNode>) {
+        // Enforce 1:1 connections: an output can only go to one input, 
+        // and an input can only receive from one output.
+        // If a user tries to connect a new wire, we drop the old ones first.
+        snarl.drop_outputs(from.id);
+        snarl.drop_inputs(to.id);
+        snarl.connect(from.id, to.id);
+    }
 }
 
 /// Show the node graph in a UI area.
