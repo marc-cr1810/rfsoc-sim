@@ -103,19 +103,16 @@ impl RfSocSimApp {
             return;
         }
 
-        // Compute maximum decimation to ensure output FFT is not starved of samples
-        let mut max_decim = 1;
-        for t in &self.rfdc.adc_tiles {
-            if t.enabled {
-                for b in &t.blocks {
-                    if b.enabled {
-                        max_decim = max_decim.max(b.decimation.factor());
-                    }
-                }
-            }
-        }
-        let num_samples = (2048 * max_decim as usize).clamp(4096, 65536);
         let input_sample_rate_mhz = 15000.0; // 15 GHz wideband to support signals up to 7.5 GHz
+
+        // The ADC-rate and DDC FFTs consume samples at the *tile* rate, so the wideband
+        // buffer has to be scaled by the oversampling ratio — sizing it in wideband samples
+        // starves those FFTs of resolution whenever Fs is well below the simulation rate.
+        let oversampling = (input_sample_rate_mhz / tile.sample_rate_mhz().max(1.0)).max(1.0);
+        let needed_tile_samples = dsp::required_tile_samples(block.decimation.factor());
+        let num_samples = dsp::next_smooth_size(
+            ((needed_tile_samples as f64 * oversampling).ceil() as usize).clamp(4096, 131_072),
+        );
 
         let graph_res = crate::node_graph::nodes::evaluate_graph(
             &self.snarl,

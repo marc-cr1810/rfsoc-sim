@@ -83,7 +83,14 @@ pub fn show_spectrum_view(
         ui.separator();
 
         let rf_chain_overlay = match (&signal.rf_chain_response_db, &signal.rf_chain_freq_axis_mhz) {
-            (Some(resp), Some(freq)) => Some((resp.as_slice(), freq.as_slice())),
+            (Some(resp), Some(freq)) => Some(ResponseOverlay {
+                values_db: resp,
+                freq_axis_mhz: freq,
+                name: "RF chain H(f)",
+                color: Theme::ACCENT_WARN,
+                dashed: false,
+                floor_db: -150.0,
+            }),
             _ => None,
         };
 
@@ -92,62 +99,132 @@ pub fn show_spectrum_view(
             .as_ref()
             .map(|raw| (raw.as_slice(), signal.input_freq_axis_mhz.as_slice()));
 
+        let plot_height = plot_height * 0.8; // four stacked panes now
+
         // 1. Input Spectrum with RF Chain overlay
         show_single_spectrum(
             ui,
-            "input_spectrum",
-            "Input Spectrum (Pre-ADC)",
-            &signal.input_spectrum_dbfs,
-            &signal.input_freq_axis_mhz,
-            plot_height,
-            Theme::ACCENT_PRIMARY,
-            tile_fs_mhz,
-            rf_chain_overlay,
-            raw_source_overlay,
-            false,
-            None,
+            SpectrumPlot {
+                id: "input_spectrum",
+                title: "Input Spectrum at ADC Pin (Pre-Sampling, Real Voltage)".to_string(),
+                spectrum: &signal.input_spectrum_dbfs,
+                freq_axis: &signal.input_freq_axis_mhz,
+                height: plot_height,
+                color: Theme::ACCENT_PRIMARY,
+                span_rate_mhz: tile_fs_mhz,
+                legend: {
+                    let mut items = vec![("at ADC pin", Theme::ACCENT_PRIMARY)];
+                    if raw_source_overlay.is_some() {
+                        items.push(("raw source", Theme::TEXT_SECONDARY));
+                    }
+                    if rf_chain_overlay.is_some() {
+                        items.push(("RF chain H(f)", Theme::ACCENT_WARN));
+                    }
+                    items
+                },
+                response_overlay: rf_chain_overlay,
+                raw_source_overlay,
+                show_nyquist_zones: true,
+                ..Default::default()
+            },
         );
 
         ui.add_space(4.0);
 
-        // 2. Folded Spectrum (what ADC sees)
+        // 2. Folded Spectrum (what the converter actually digitises)
         show_single_spectrum(
             ui,
-            "folded_spectrum",
-            "Folded Spectrum (ADC Output, 0–Fs/2)",
-            &signal.folded_spectrum_dbfs,
-            &signal.folded_freq_axis_mhz,
-            plot_height,
-            Theme::ZONE_1,
-            tile_fs_mhz,
-            None,
-            None,
-            false,
-            None,
+            SpectrumPlot {
+                id: "folded_spectrum",
+                title: "Folded Spectrum (ADC Digital Output, 0–Fs/2)".to_string(),
+                spectrum: &signal.folded_spectrum_dbfs,
+                freq_axis: &signal.folded_freq_axis_mhz,
+                height: plot_height,
+                color: Theme::ZONE_1,
+                span_rate_mhz: tile_fs_mhz,
+                show_nyquist_zones: true,
+                ..Default::default()
+            },
+        );
+
+        ui.add_space(4.0);
+
+        // 3. Post-mixer spectrum at the full ADC rate, with the decimation filter drawn on
+        //    top. This is the stage that explains the baseband plot below: the mixer's
+        //    real-to-I/Q image and any out-of-band signal are visible here, and the shaded
+        //    band is the only part the decimation chain passes to the PL.
+        let keep_band = if signal.output_sample_rate_mhz > 0.0 {
+            Some((
+                crate::dsp::DDC_PASSBAND_FRAC * signal.output_sample_rate_mhz,
+                signal.output_sample_rate_mhz / 2.0,
+            ))
+        } else {
+            None
+        };
+
+        show_single_spectrum(
+            ui,
+            SpectrumPlot {
+                id: "post_mixer_spectrum",
+                title: format!(
+                    "Post-Mixer DDC Spectrum (at Fs = {:.1} MHz, NCO = {:+.3} MHz)",
+                    tile_fs_mhz, signal.resolved_nco_freq_mhz
+                ),
+                legend: vec![
+                    ("mixer output", Theme::ZONE_3),
+                    ("decimation filter H(f)", Theme::ACCENT_WARN),
+                    ("kept for PL", Theme::ACCENT_SECONDARY),
+                ],
+                spectrum: &signal.post_mixer_spectrum_dbfs,
+                freq_axis: &signal.post_mixer_freq_axis_mhz,
+                height: plot_height,
+                color: Theme::ZONE_3,
+                span_rate_mhz: tile_fs_mhz,
+                two_sided: signal.complex_output,
+                response_overlay: Some(ResponseOverlay {
+                    values_db: &signal.decimation_response_db,
+                    freq_axis_mhz: &signal.post_mixer_freq_axis_mhz,
+                    name: "Decimation filter H(f)",
+                    color: Theme::ACCENT_WARN,
+                    dashed: true,
+                    // Well below any realistic noise floor, so nothing meaningful is hidden.
+                    floor_db: -120.0,
+                }),
+                ddc_keep_band_mhz: keep_band,
+                show_dc_marker: signal.complex_output,
+                ..Default::default()
+            },
         );
 
         ui.add_space(4.0);
 
         let link_group = ui.id().with("baseband_x_link");
 
-        // 3. Post-DDC Spectrum with Peak & Delta Markers
+        // 4. Post-DDC Spectrum — what the PL receives
         show_single_spectrum(
             ui,
-            "output_spectrum",
-            &format!(
-                "Post-DDC Complex Baseband Spectrum (Output Rate: {:.1} MHz, Span: ±{:.1} MHz)",
-                signal.output_sample_rate_mhz,
-                signal.output_sample_rate_mhz / 2.0
-            ),
-            &signal.output_spectrum_dbfs,
-            &signal.output_freq_axis_mhz,
-            plot_height,
-            Theme::ACCENT_SECONDARY,
-            signal.output_sample_rate_mhz,
-            None,
-            None,
-            true,
-            Some(link_group),
+            SpectrumPlot {
+                id: "output_spectrum",
+                title: format!(
+                    "Post-DDC Baseband Spectrum to PL (Output Rate: {:.1} MHz, Span: {}{:.1} MHz)",
+                    signal.output_sample_rate_mhz,
+                    if signal.complex_output { "±" } else { "0–" },
+                    signal.output_sample_rate_mhz / 2.0
+                ),
+                spectrum: &signal.output_spectrum_dbfs,
+                freq_axis: &signal.output_freq_axis_mhz,
+                height: plot_height,
+                color: Theme::ACCENT_SECONDARY,
+                span_rate_mhz: signal.output_sample_rate_mhz,
+                two_sided: signal.complex_output,
+                show_dc_marker: signal.complex_output,
+                show_peak_markers: true,
+                usable_band_mhz: Some(
+                    crate::dsp::DDC_PASSBAND_FRAC * signal.output_sample_rate_mhz,
+                ),
+                link_group: Some(link_group),
+                ..Default::default()
+            },
         );
 
         ui.add_space(4.0);
@@ -411,24 +488,105 @@ pub fn show_spectrum_view(
     }
 }
 
-fn show_single_spectrum(
-    ui: &mut egui::Ui,
-    id: &str,
-    title: &str,
-    spectrum: &[f64],
-    freq_axis: &[f64],
+/// A transfer-function curve drawn over a spectrum, in dB rather than dBFS.
+struct ResponseOverlay<'a> {
+    values_db: &'a [f64],
+    freq_axis_mhz: &'a [f64],
+    name: &'a str,
+    color: egui::Color32,
+    dashed: bool,
+    /// Clamp the drawn curve here. Deep stopband ripple is real but tangles with the noise
+    /// floor, and the passband and transition are what the pane is for.
+    floor_db: f64,
+}
+
+/// Configuration for one stacked spectrum pane.
+struct SpectrumPlot<'a> {
+    id: &'a str,
+    title: String,
+    spectrum: &'a [f64],
+    freq_axis: &'a [f64],
     height: f32,
     color: egui::Color32,
-    fs_mhz: f64,
-    rf_overlay: Option<(&[f64], &[f64])>,
-    raw_source_overlay: Option<(&[f64], &[f64])>,
-    is_complex_baseband: bool,
+    /// Sample rate the pane's span is derived from: 0..rate/2, or ±rate/2 when `two_sided`.
+    span_rate_mhz: f64,
+    two_sided: bool,
+    /// Secondary transfer-function curve, kept visually distinct from the spectrum trace.
+    response_overlay: Option<ResponseOverlay<'a>>,
+    raw_source_overlay: Option<(&'a [f64], &'a [f64])>,
+    show_nyquist_zones: bool,
+    /// Band the decimation chain keeps: (passband edge, output Nyquist) in MHz.
+    ddc_keep_band_mhz: Option<(f64, f64)>,
+    /// Draw the ±0.4·Fout usable-bandwidth edges on an output plot.
+    usable_band_mhz: Option<f64>,
+    show_dc_marker: bool,
+    show_peak_markers: bool,
+    /// Colour key rendered next to the title, since the panes carry no plot legend.
+    legend: Vec<(&'a str, egui::Color32)>,
     link_group: Option<egui::Id>,
-) {
+}
+
+impl Default for SpectrumPlot<'_> {
+    fn default() -> Self {
+        Self {
+            id: "",
+            title: String::new(),
+            spectrum: &[],
+            freq_axis: &[],
+            height: 160.0,
+            color: Theme::ACCENT_PRIMARY,
+            span_rate_mhz: 0.0,
+            two_sided: false,
+            response_overlay: None,
+            raw_source_overlay: None,
+            show_nyquist_zones: false,
+            ddc_keep_band_mhz: None,
+            usable_band_mhz: None,
+            show_dc_marker: false,
+            show_peak_markers: false,
+            legend: Vec::new(),
+            link_group: None,
+        }
+    }
+}
+
+fn show_single_spectrum(ui: &mut egui::Ui, p: SpectrumPlot<'_>) {
+    let SpectrumPlot {
+        id,
+        ref title,
+        spectrum,
+        freq_axis,
+        height,
+        color,
+        span_rate_mhz: fs_mhz,
+        two_sided,
+        response_overlay: rf_overlay,
+        raw_source_overlay,
+        show_nyquist_zones,
+        ddc_keep_band_mhz,
+        usable_band_mhz,
+        show_dc_marker,
+        show_peak_markers,
+        ref legend,
+        link_group,
+    } = p;
+
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).strong().size(13.0));
 
-        if is_complex_baseband {
+        // Painted swatches rather than box-drawing glyphs, which the bundled fonts lack.
+        for (label, color) in legend {
+            ui.add_space(6.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 3.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 1.0, *color);
+            ui.label(
+                egui::RichText::new(*label)
+                    .color(Theme::TEXT_SECONDARY)
+                    .size(11.0),
+            );
+        }
+
+        if show_peak_markers {
             let peaks = find_spectral_peaks(spectrum, freq_axis, -100.0);
             if peaks.len() >= 2 {
                 let p1 = peaks[0];
@@ -478,7 +636,7 @@ fn show_single_spectrum(
     let mut plot = Plot::new(id)
         .height(height)
         .label_formatter(label_fmt)
-        .x_axis_label(if is_complex_baseband {
+        .x_axis_label(if two_sided {
             "Baseband Offset Frequency (MHz)"
         } else {
             "Frequency (MHz)"
@@ -491,7 +649,7 @@ fn show_single_spectrum(
         plot = plot.link_axis(lg, [true, false]);
     }
 
-    if is_complex_baseband {
+    if two_sided {
         let span = fs_mhz / 2.0;
         plot = plot.include_x(-span).include_x(span);
     } else {
@@ -503,26 +661,27 @@ fn show_single_spectrum(
         let min_freq = freq_axis.first().copied().unwrap_or(0.0);
         let max_freq = freq_axis.last().copied().unwrap_or(fs_mhz / 2.0);
 
-        if !is_complex_baseband {
+        if show_nyquist_zones {
             // Draw Nyquist zones in the background
             let nyquist_bw = fs_mhz / 2.0;
             let max_zone = (max_freq / nyquist_bw).ceil() as usize;
             for zone in 1..=max_zone {
                 let start_f = (zone as f64 - 1.0) * nyquist_bw;
                 let end_f = (zone as f64) * nyquist_bw;
-                
+
                 let poly_points: PlotPoints = vec![
                     [start_f, -150.0],
                     [end_f, -150.0],
                     [end_f, 10.0],
                     [start_f, 10.0],
                 ].into();
-                
+
                 let poly = egui_plot::Polygon::new(
                     format!("Nyquist Zone {zone}"),
                     poly_points,
                 )
-                .fill_color(Theme::zone_color(zone).linear_multiply(0.05));
+                .fill_color(Theme::zone_color(zone).linear_multiply(0.05))
+                .stroke(egui::Stroke::NONE);
                 plot_ui.polygon(poly);
 
                 let boundary = zone as f64 * nyquist_bw;
@@ -534,6 +693,60 @@ fn show_single_spectrum(
                         .style(egui_plot::LineStyle::dashed_dense());
                     plot_ui.line(zone_line);
                 }
+            }
+        }
+
+        // Shade the band the decimation chain hands to the PL, in the same green the output
+        // pane uses so the two read as the same band. Two tints: the guaranteed-flat
+        // 0.4·Fout passband, and the strip out to the output Nyquist where the filter is
+        // still in transition. Strokes are suppressed so only the fills show.
+        if let Some((pass_edge, nyq_edge)) = ddc_keep_band_mhz {
+            for (edge, alpha, name) in [
+                (nyq_edge, 0.07_f32, "DDC output span (±Fout/2)"),
+                (pass_edge, 0.12, "DDC usable band (±0.4·Fout)"),
+            ] {
+                let band: PlotPoints = vec![
+                    [-edge, -150.0],
+                    [edge, -150.0],
+                    [edge, 10.0],
+                    [-edge, 10.0],
+                ]
+                .into();
+                plot_ui.polygon(
+                    egui_plot::Polygon::new(name, band)
+                        .fill_color(Theme::ACCENT_SECONDARY.linear_multiply(alpha))
+                        .stroke(egui::Stroke::NONE),
+                );
+            }
+            // Crisp edges at the two boundaries.
+            for (edge, color) in [
+                (nyq_edge, Theme::TEXT_SECONDARY.linear_multiply(0.45)),
+                (pass_edge, Theme::ACCENT_SECONDARY.linear_multiply(0.55)),
+            ] {
+                for side in [-1.0_f64, 1.0] {
+                    let x = side * edge;
+                    let pts: PlotPoints = vec![[x, -150.0], [x, 10.0]].into();
+                    plot_ui.line(
+                        Line::new("", pts)
+                            .color(color)
+                            .width(1.0)
+                            .style(egui_plot::LineStyle::dashed_loose()),
+                    );
+                }
+            }
+        }
+
+        // Mark the guaranteed-flat usable bandwidth on the output plot.
+        if let Some(edge) = usable_band_mhz {
+            for side in [-1.0_f64, 1.0] {
+                let x = side * edge;
+                let pts: PlotPoints = vec![[x, -150.0], [x, 10.0]].into();
+                plot_ui.line(
+                    Line::new("Usable BW edge (±0.4·Fout)", pts)
+                        .color(Theme::ACCENT_SECONDARY.linear_multiply(0.5))
+                        .width(1.0)
+                        .style(egui_plot::LineStyle::dashed_loose()),
+                );
             }
         }
 
@@ -556,23 +769,28 @@ fn show_single_spectrum(
         // Render main filtered spectrum line
         plot_ui.line(line);
 
-        // Render RF Chain H(f) overlay if provided
-        if let Some((resp_db, resp_freq)) = rf_overlay {
-            let overlay_points: PlotPoints = resp_freq
+        // Render the response overlay (RF chain H(f), or the decimation filter)
+        if let Some(ov) = rf_overlay {
+            let overlay_points: PlotPoints = ov
+                .freq_axis_mhz
                 .iter()
-                .zip(resp_db.iter())
+                .zip(ov.values_db.iter())
                 .filter(|&(&f, _)| f >= min_freq && f <= max_freq)
-                .map(|(&f, &db)| [f, db.max(-150.0)])
+                .map(|(&f, &db)| [f, db.max(ov.floor_db)])
                 .collect();
 
-            let overlay_line = Line::new(format!("{id}_rf_overlay"), overlay_points)
-                .color(Theme::ACCENT_WARN)
+            let overlay_line = Line::new(ov.name, overlay_points)
+                .color(ov.color)
                 .width(2.0)
-                .style(egui_plot::LineStyle::Solid);
+                .style(if ov.dashed {
+                    egui_plot::LineStyle::dashed_loose()
+                } else {
+                    egui_plot::LineStyle::Solid
+                });
             plot_ui.line(overlay_line);
         }
 
-        if is_complex_baseband {
+        if show_dc_marker {
             // Render vertical line for 0 Hz (DC / Tuned RF Center)
             let dc_line_points: PlotPoints = vec![[0.0, -150.0], [0.0, 10.0]].into();
             let dc_line = Line::new(format!("{id}_dc_center"), dc_line_points)
@@ -580,7 +798,9 @@ fn show_single_spectrum(
                 .width(1.5)
                 .style(egui_plot::LineStyle::dashed_dense());
             plot_ui.line(dc_line);
+        }
 
+        if show_peak_markers {
             // Render Peak markers as vertical lines
             let peaks = find_spectral_peaks(spectrum, freq_axis, -100.0);
             for (idx, pk) in peaks.iter().take(2).enumerate() {

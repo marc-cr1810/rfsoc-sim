@@ -277,6 +277,46 @@ pub fn show_config_panel(ui: &mut egui::Ui, config: &mut RfdcConfig, selected_ti
     });
 
     ui.separator();
+    ui.collapsing("📡 Analog Input Bandwidth", |ui| {
+        let afe = &mut block.analog_front_end;
+        ui.checkbox(&mut afe.enabled, "Model track-and-hold bandwidth");
+        ui.label(
+            egui::RichText::new(
+                "Rolls off the input before sampling, so higher Nyquist zones alias down \
+                 attenuated instead of at full scale.",
+            )
+            .color(Theme::TEXT_SECONDARY)
+            .size(11.0),
+        );
+        if afe.enabled {
+            ui.horizontal(|ui| {
+                help_label(ui, "−3 dB BW:", "Analog input bandwidth of the converter front end. Gen 3 RFSoC ADCs are around 6 GHz.");
+                ui.add(
+                    egui::DragValue::new(&mut afe.bandwidth_ghz)
+                        .range(0.5..=20.0)
+                        .speed(0.1)
+                        .suffix(" GHz"),
+                );
+            });
+            ui.horizontal(|ui| {
+                help_label(ui, "Order:", "Roll-off order of the equivalent low-pass response. Higher orders fall off faster past the −3 dB point.");
+                ui.add(egui::DragValue::new(&mut afe.order).range(1..=6).speed(1));
+            });
+            let fs_nyq = tile_fs * 1000.0 / 2.0;
+            ui.label(
+                egui::RichText::new(format!(
+                    "Response: {:.1} dB at Fs/2, {:.1} dB at 3·Fs/2, {:.1} dB at 5·Fs/2",
+                    afe.response_db(fs_nyq),
+                    afe.response_db(3.0 * fs_nyq),
+                    afe.response_db(5.0 * fs_nyq),
+                ))
+                .color(Theme::TEXT_SECONDARY)
+                .size(11.0),
+            );
+        }
+    });
+
+    ui.separator();
     ui.collapsing("🔬 ADC Hardware Non-Idealities", |ui| {
         let non = &mut block.non_idealities;
         ui.checkbox(&mut non.enabled, "Enable Hardware Distortion");

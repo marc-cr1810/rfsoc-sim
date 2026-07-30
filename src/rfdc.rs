@@ -161,6 +161,9 @@ pub struct AutoTuneResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdcNonIdealities {
     pub enabled: bool,
+    /// Effective number of bits. Sets the broadband noise floor via
+    /// SNR = 6.02·ENOB + 1.76 dB, which is what limits a real converter rather than
+    /// the raw quantiser step.
     pub enob: f64,
     pub quantization_bits: u8,
     pub hd2_dbc: f64,
@@ -181,6 +184,51 @@ impl Default for AdcNonIdealities {
     }
 }
 
+/// Analog input bandwidth of the converter front end.
+///
+/// The track-and-hold has finite bandwidth, so signals sampled from high Nyquist zones
+/// alias down attenuated rather than at full scale. Without this, every zone folds in at
+/// 0 dB, which no real converter does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalogFrontEnd {
+    pub enabled: bool,
+    /// −3 dB analog input bandwidth in GHz.
+    pub bandwidth_ghz: f64,
+    /// Roll-off order of the equivalent low-pass response.
+    pub order: u32,
+}
+
+impl Default for AnalogFrontEnd {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Gen 3 RFSoC ADC analog input bandwidth.
+            bandwidth_ghz: 6.0,
+            // Order 3 keeps the passband flat and puts a defined knee at the -3 dB corner,
+            // which is closer to a real converter front end than a single- or two-pole slope.
+            order: 3,
+        }
+    }
+}
+
+impl AnalogFrontEnd {
+    /// Linear magnitude response at `freq_mhz`.
+    ///
+    /// Butterworth-style: |H| = 1 / sqrt(1 + (f/f3dB)^(2n)).
+    pub fn gain_linear(&self, freq_mhz: f64) -> f64 {
+        if !self.enabled || self.bandwidth_ghz <= 0.0 {
+            return 1.0;
+        }
+        let ratio = freq_mhz.abs() / (self.bandwidth_ghz * 1000.0);
+        (1.0 / (1.0 + ratio.powi(2 * self.order as i32))).sqrt()
+    }
+
+    /// Magnitude response in dB at `freq_mhz`.
+    pub fn response_db(&self, freq_mhz: f64) -> f64 {
+        20.0 * self.gain_linear(freq_mhz).max(1e-15).log10()
+    }
+}
+
 /// A single ADC converter block with its DDC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdcBlock {
@@ -194,6 +242,8 @@ pub struct AdcBlock {
     pub decimation: DecimationFactor,
     pub calibration_mode: CalibrationMode,
     pub non_idealities: AdcNonIdealities,
+    #[serde(default)]
+    pub analog_front_end: AnalogFrontEnd,
     pub axi_words_per_clock: u32,
 }
 
@@ -210,6 +260,7 @@ impl AdcBlock {
             decimation: DecimationFactor::X1,
             calibration_mode: CalibrationMode::Mode1,
             non_idealities: AdcNonIdealities::default(),
+            analog_front_end: AnalogFrontEnd::default(),
             axi_words_per_clock: 4,
         }
     }
@@ -220,6 +271,21 @@ impl AdcBlock {
 
     pub fn mixer_active(&self) -> bool {
         self.mixer_settings.mixer_type != MixerType::Off
+    }
+
+    /// True when the DDC hands complex I/Q to the PL, so the output spectrum spans
+    /// ±Fout/2. A bypassed or real-to-real mixer leaves the stream real, and its spectrum
+    /// is single-sided 0..Fout/2.
+    pub fn produces_complex_output(&self) -> bool {
+        let ms = &self.mixer_settings;
+        match ms.mixer_type {
+            MixerType::Off => false,
+            MixerType::Coarse => {
+                ms.mixer_mode != MixerMode::RealToReal
+                    && !matches!(ms.coarse_mix_freq, CoarseMixFreq::Bypass | CoarseMixFreq::Off)
+            }
+            MixerType::Fine => ms.mixer_mode != MixerMode::RealToReal,
+        }
     }
 
     pub fn validate(&self, tile_fs_mhz: f64) -> Vec<String> {
@@ -236,13 +302,24 @@ impl AdcBlock {
             errors.push("Coarse mixer with Real-to-Real mode requires Bypass frequency.".into());
         }
         if ms.mixer_type == MixerType::Coarse && ms.mixer_mode == MixerMode::IqToIq {
-            errors.push("Coarse mixer with I/Q→I/Q mode is invalid on ADC (input is always real).".into());
+            errors.push("Coarse mixer with I/Q->I/Q mode is invalid on ADC (input is always real).".into());
         }
         if ms.mixer_type == MixerType::Fine && ms.freq.abs() < 1e-9 {
             errors.push("⚠ Fine mixer NCO frequency is 0 Hz (functionally a bypass).".into());
         }
         if self.decimation.factor() > 1 && ms.mixer_type == MixerType::Off {
-            errors.push("⚠ Decimation > ×1 with mixer off: no anti-alias filtering applied.".into());
+            errors.push(
+                "⚠ Decimation > ×1 with mixer off: the decimation filter keeps only 0..0.4×Fout, \
+                 so anything above that is filtered away rather than tuned down."
+                    .into(),
+            );
+        }
+        if self.decimation.factor() == 1 && self.produces_complex_output() {
+            errors.push(
+                "⚠ Decimation ×1 bypasses the decimation filter, so the real-to-I/Q mixer image \
+                 at −(F_in + F_NCO) reaches the PL unfiltered."
+                    .into(),
+            );
         }
         if self.dsa_db < 0.0 || self.dsa_db > 27.0 {
             errors.push("DSA attenuation must be between 0 and 27 dB.".into());
@@ -556,7 +633,7 @@ mod tests {
         block.mixer_settings.coarse_mix_freq = CoarseMixFreq::FsOver4;
 
         let errors = block.validate(4000.0);
-        assert!(errors.iter().any(|e| e.contains("I/Q→I/Q mode is invalid on ADC")));
+        assert!(errors.iter().any(|e| e.contains("I/Q->I/Q mode is invalid on ADC")));
     }
 
     #[test]
