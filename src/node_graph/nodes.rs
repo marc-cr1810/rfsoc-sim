@@ -861,7 +861,7 @@ mod tests {
             let mut tone = SignalGenerator::default();
             tone.tones[0].frequency_mhz = 1000.0;
             tone.tones[0].amplitude_dbfs = -40.0;
-            tone.tones[0].modulation = crate::signal::ToneModulation::RealCosine;
+            tone.tones[0].modulation = crate::signal::ToneModulation::Cw;
             tone.noise_enabled = false;
 
             let sig = evaluate_graph(&snarl, 0, 0, n, fs, &tone, 0.0,
@@ -999,7 +999,7 @@ mod tests {
             let mut src = SignalSourceNode::default();
             src.source_type = SourceType::LocalGenerator;
             src.generator.noise_enabled = false;
-            src.generator.tones[0].modulation = crate::signal::ToneModulation::RealCosine;
+            src.generator.tones[0].modulation = crate::signal::ToneModulation::Cw;
             src.generator.tones[0].amplitude_dbfs = 0.0;
             let s = snarl.insert_node(egui::pos2(0.0, 0.0), RfNode::SignalSource(src));
             let c = snarl.insert_node(egui::pos2(100.0, 0.0), RfNode::DirectionalCoupler(coupler.clone()));
@@ -1032,7 +1032,7 @@ mod tests {
         let (snarl, _) = build_chain(vec![amp, pad]);
         let mut g = SignalGenerator::default();
         g.tones[0].amplitude_dbfs = -40.0;
-        g.tones[0].modulation = crate::signal::ToneModulation::RealCosine;
+        g.tones[0].modulation = crate::signal::ToneModulation::Cw;
         g.noise_enabled = false;
 
         let res = evaluate_graph(&snarl, 0, 0, 4096, 15000.0, &g, 0.0, &quiet_env()).unwrap();
@@ -1069,7 +1069,7 @@ mod tests {
                 amplitude_dbfs: -10.0,
                 phase_deg: 0.0,
                 bandwidth_mhz: 200.0,
-                modulation: crate::signal::ToneModulation::RealCosine,
+                modulation: crate::signal::ToneModulation::Cw,
             }],
             noise_floor_dbfs: -200.0,
             noise_enabled: false,
@@ -1098,7 +1098,7 @@ mod tests {
         let (snarl, _) = build_chain(vec![amp]);
         let mut hot = SignalGenerator::default();
         hot.tones[0].amplitude_dbfs = -3.0;
-        hot.tones[0].modulation = crate::signal::ToneModulation::RealCosine;
+        hot.tones[0].modulation = crate::signal::ToneModulation::Cw;
         hot.noise_enabled = false;
 
         let res = evaluate_graph(&snarl, 0, 0, 4096, 15000.0, &hot, 0.0, &quiet_env()).unwrap();
@@ -1131,6 +1131,8 @@ mod tests {
                 modulation: crate::signal::ToneModulation::PulsedRadar {
                     pulse_width_us: 0.2,
                     pri_us: 0.5,
+                    rise_ns: 0.0,
+                    chirp_mhz: 0.0,
                 },
             }],
             noise_floor_dbfs: -200.0,

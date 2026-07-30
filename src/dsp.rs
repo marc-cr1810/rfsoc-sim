@@ -1446,9 +1446,9 @@ mod tests {
         let mut sig_gen = SignalGenerator::default();
         sig_gen.tones = vec![
             Tone { frequency_mhz: 2600.0, amplitude_dbfs: -6.0, phase_deg: 0.0,
-                   bandwidth_mhz: 0.0, modulation: ToneModulation::RealCosine },
+                   bandwidth_mhz: 0.0, modulation: ToneModulation::Cw },
             Tone { frequency_mhz: 2900.0, amplitude_dbfs: -6.0, phase_deg: 0.0,
-                   bandwidth_mhz: 0.0, modulation: ToneModulation::RealCosine },
+                   bandwidth_mhz: 0.0, modulation: ToneModulation::Cw },
         ];
         sig_gen.noise_enabled = false;
 
@@ -1491,7 +1491,7 @@ mod tests {
         // The pre-ADC plot and the folded plot must report the same level for the same
         // signal, for a complex-exponential source as well as a real one — the ADC samples
         // the real voltage either way.
-        for modulation in [ToneModulation::Cw, ToneModulation::RealCosine] {
+        for modulation in [ToneModulation::Cw, ToneModulation::Cw] {
             let tile = AdcTile::new(0);
             let mut block = tile.blocks[0].clone();
             block.mixer_settings.mixer_type = MixerType::Off;
@@ -1540,7 +1540,7 @@ mod tests {
                 amplitude_dbfs: 0.0,
                 phase_deg: 0.0,
                 bandwidth_mhz: 0.0,
-                modulation: ToneModulation::RealCosine,
+                modulation: ToneModulation::Cw,
             }];
             sig_gen.noise_enabled = false;
             let input = sig_gen.generate(8192, 15000.0);
@@ -1725,7 +1725,7 @@ mod tests {
                 amplitude_dbfs: -6.0,
                 phase_deg: 0.0,
                 bandwidth_mhz: 0.0,
-                modulation: ToneModulation::RealCosine,
+                modulation: ToneModulation::Cw,
             }];
             sig_gen.noise_enabled = false;
             let input = sig_gen.generate(16384, 15000.0);

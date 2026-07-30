@@ -17,6 +17,9 @@ struct SimulatorState {
     chain_env: ChainEnvironment,
 }
 
+/// Wideband simulation rate in MHz, high enough to carry signals up to 7.5 GHz.
+pub const SIM_SAMPLE_RATE_MHZ: f64 = 15000.0;
+
 /// Cascaded RF budget of the chain feeding the selected block.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainBudget {
@@ -282,7 +285,7 @@ impl RfSocSimApp {
             return;
         }
 
-        let input_sample_rate_mhz = 15000.0; // 15 GHz wideband to support signals up to 7.5 GHz
+        let input_sample_rate_mhz = SIM_SAMPLE_RATE_MHZ;
 
         // The ADC-rate and DDC FFTs consume samples at the *tile* rate, so the wideband
         // buffer has to be scaled by the oversampling ratio — sizing it in wideband samples
@@ -501,194 +504,12 @@ impl eframe::App for RfSocSimApp {
                     ui.heading("🎵 Signal Generator");
                     ui.separator();
 
-                    let sig = &mut self.signal_gen;
-
-                    // Number of tones
-                    ui.horizontal(|ui| {
-                        ui.label("Tones:");
-                        if ui.button("+").clicked() {
-                            sig.tones.push(crate::signal::Tone::default());
-                        }
-                        if sig.tones.len() > 1 && ui.button("-").clicked() {
-                            sig.tones.pop();
-                        }
-                    });
-
-                    for (i, tone) in sig.tones.iter_mut().enumerate() {
-                        ui.group(|ui| {
-                            ui.label(format!("Tone {}", i));
-                            ui.horizontal(|ui| {
-                                ui.label("f:");
-                                ui.add(
-                                    egui::DragValue::new(&mut tone.frequency_mhz)
-                                        .range(0.1..=10000.0)
-                                        .suffix(" MHz")
-                                        .speed(10.0),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("A:");
-                                ui.add(
-                                    egui::DragValue::new(&mut tone.amplitude_dbfs)
-                                        .range(-120.0..=0.0)
-                                        .suffix(" dBFS")
-                                        .speed(0.5),
-                                );
-                            });
-
-                            // Modulation type selector
-                            ui.horizontal(|ui| {
-                                ui.label("Mod:");
-                                egui::ComboBox::from_id_salt(format!("tone_mod_{i}"))
-                                    .selected_text(tone.modulation.to_string())
-                                    .show_ui(ui, |ui| {
-                                        use crate::signal::ToneModulation::*;
-                                        if ui.selectable_label(matches!(tone.modulation, Cw), "CW (Complex Tone)").clicked() { tone.modulation = Cw; }
-                                        if ui.selectable_label(matches!(tone.modulation, RealCosine), "Cosine").clicked() { tone.modulation = RealCosine; }
-                                        if ui.selectable_label(matches!(tone.modulation, RealSine), "Sine").clicked() { tone.modulation = RealSine; }
-                                        if ui.selectable_label(matches!(tone.modulation, Square), "Square").clicked() { tone.modulation = Square; }
-                                        if ui.selectable_label(matches!(tone.modulation, Sawtooth), "Sawtooth").clicked() { tone.modulation = Sawtooth; }
-                                        if ui.selectable_label(matches!(tone.modulation, Triangle), "Triangle").clicked() { tone.modulation = Triangle; }
-                                        if ui.selectable_label(matches!(tone.modulation, SweptChirp { .. }), "FMCW Chirp Sweep").clicked() { tone.modulation = SweptChirp { sweep_period_ms: 10.0 }; }
-                                        if ui.selectable_label(matches!(tone.modulation, FmModulated { .. }), "FM Modulated").clicked() { tone.modulation = FmModulated { dev_mhz: 50.0, mod_freq_khz: 10.0 }; }
-                                        if ui.selectable_label(matches!(tone.modulation, PulsedRadar { .. }), "Pulsed Radar").clicked() { tone.modulation = PulsedRadar { pulse_width_us: 20.0, pri_us: 100.0 }; }
-                                        if ui.selectable_label(matches!(tone.modulation, FreqHopping { .. }), "Frequency Hopping").clicked() { tone.modulation = FreqHopping { hop_step_mhz: 50.0, num_channels: 8, hop_rate_hz: 500.0 }; }
-                                        if ui.selectable_label(matches!(tone.modulation, DigitalQpsk { .. }), "Digital QPSK").clicked() { tone.modulation = DigitalQpsk { symbol_rate_ksps: 100.0 }; }
-                                    });
-                            });
-
-                            // Modulation-specific parameters
-                            match &mut tone.modulation {
-                                crate::signal::ToneModulation::SweptChirp { sweep_period_ms } => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("BW:");
-                                        ui.add(
-                                            egui::DragValue::new(&mut tone.bandwidth_mhz)
-                                                .range(1.0..=2000.0)
-                                                .suffix(" MHz")
-                                                .speed(5.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Period:");
-                                        ui.add(
-                                            egui::DragValue::new(sweep_period_ms)
-                                                .range(0.1..=1000.0)
-                                                .suffix(" ms")
-                                                .speed(1.0),
-                                        );
-                                    });
-                                }
-                                crate::signal::ToneModulation::FmModulated { dev_mhz, mod_freq_khz } => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Dev:");
-                                        ui.add(
-                                            egui::DragValue::new(dev_mhz)
-                                                .range(0.1..=500.0)
-                                                .suffix(" MHz")
-                                                .speed(1.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("f_m:");
-                                        ui.add(
-                                            egui::DragValue::new(mod_freq_khz)
-                                                .range(0.1..=1000.0)
-                                                .suffix(" kHz")
-                                                .speed(1.0),
-                                        );
-                                    });
-                                }
-                                crate::signal::ToneModulation::PulsedRadar { pulse_width_us, pri_us } => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("PW:");
-                                        ui.add(
-                                            egui::DragValue::new(pulse_width_us)
-                                                .range(0.5..=1000.0)
-                                                .suffix(" µs")
-                                                .speed(1.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("PRI:");
-                                        ui.add(
-                                            egui::DragValue::new(pri_us)
-                                                .range(1.0..=5000.0)
-                                                .suffix(" µs")
-                                                .speed(5.0),
-                                        );
-                                    });
-                                }
-                                crate::signal::ToneModulation::FreqHopping { hop_step_mhz, num_channels, hop_rate_hz } => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Step:");
-                                        ui.add(
-                                            egui::DragValue::new(hop_step_mhz)
-                                                .range(1.0..=500.0)
-                                                .suffix(" MHz")
-                                                .speed(2.0),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Chans:");
-                                        ui.add(
-                                            egui::DragValue::new(num_channels)
-                                                .range(2..=32)
-                                                .speed(1),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Rate:");
-                                        ui.add(
-                                            egui::DragValue::new(hop_rate_hz)
-                                                .range(10.0..=10000.0)
-                                                .suffix(" Hz")
-                                                .speed(50.0),
-                                        );
-                                    });
-                                }
-                                crate::signal::ToneModulation::DigitalQpsk { symbol_rate_ksps } => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Sym Rate:");
-                                        ui.add(
-                                            egui::DragValue::new(symbol_rate_ksps)
-                                                .range(1.0..=10000.0)
-                                                .suffix(" kSPS")
-                                                .speed(10.0),
-                                        );
-                                    });
-                                }
-                                crate::signal::ToneModulation::Cw 
-                                | crate::signal::ToneModulation::RealCosine
-                                | crate::signal::ToneModulation::RealSine
-                                | crate::signal::ToneModulation::Square
-                                | crate::signal::ToneModulation::Sawtooth
-                                | crate::signal::ToneModulation::Triangle => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("BW:");
-                                        ui.add(
-                                            egui::DragValue::new(&mut tone.bandwidth_mhz)
-                                                .range(0.0..=1000.0)
-                                                .suffix(" MHz")
-                                                .speed(1.0),
-                                        );
-                                    });
-                                }
-                            }
-                        });
-                    }
-
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut sig.noise_enabled, "Noise");
-                        if sig.noise_enabled {
-                            ui.add(
-                                egui::DragValue::new(&mut sig.noise_floor_dbfs)
-                                    .range(-200.0..=0.0)
-                                    .suffix(" dBFS")
-                                    .speed(1.0),
-                            );
-                        }
-                    });
+                    crate::ui::tone_editor::generator_editor(
+                        ui,
+                        "sidebar",
+                        &mut self.signal_gen,
+                        SIM_SAMPLE_RATE_MHZ,
+                    );
                 });
             });
 
