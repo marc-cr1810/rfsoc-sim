@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use num_complex::Complex;
+use rustfft::FftPlanner;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 use std::path::PathBuf;
@@ -94,6 +95,98 @@ impl Tone {
     pub fn linear_amplitude(&self) -> f64 {
         10.0_f64.powf(self.amplitude_dbfs / 20.0)
     }
+
+    /// Whether this tone is a modulated channel rather than a bare carrier.
+    fn is_channel(&self) -> bool {
+        self.bandwidth_mhz > 0.0
+            && matches!(
+                self.modulation,
+                ToneModulation::Cw | ToneModulation::RealCosine | ToneModulation::RealSine
+            )
+    }
+
+    /// Synthesise a modulated channel `bandwidth_mhz` wide centred on the carrier.
+    ///
+    /// The field was documented as the modulated channel bandwidth but only the chirp ever
+    /// read it, so a "20 MHz channel" came out as a single spectral line. A real modulated
+    /// carrier — OFDM, QAM, anything with data on it — looks like band-limited noise, which is
+    /// exactly what filling the in-band bins with random phase and transforming back gives:
+    /// flat, precisely `bandwidth_mhz` wide, and with the same total power as the tone it
+    /// replaces, so switching the bandwidth on does not move the level.
+    ///
+    /// Real-valued modes get a conjugate-symmetric spectrum, and so stay real.
+    fn synthesise_channel(
+        &self,
+        samples: &mut [Complex<f64>],
+        sample_rate_mhz: f64,
+        start_time_us: f64,
+    ) {
+        let n = samples.len();
+        if n < 4 || sample_rate_mhz <= 0.0 {
+            return;
+        }
+        let real_valued = !matches!(self.modulation, ToneModulation::Cw);
+        let amp = self.linear_amplitude();
+        let df = sample_rate_mhz / n as f64;
+        let half_bw = self.bandwidth_mhz / 2.0;
+
+        // Data is not periodic, so the channel is redrawn each frame; seeding from the frame
+        // time keeps it deterministic while letting it evolve in the waterfall.
+        let mut seed = 0x2545_F491_4F6C_DD1D
+            ^ self.frequency_mhz.to_bits()
+            ^ start_time_us.to_bits().rotate_left(31);
+        let mut next_gaussian = || -> f64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let u1 = (((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-300)).ln() * -2.0;
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let u2 = (seed >> 11) as f64 / (1u64 << 53) as f64;
+            u1.sqrt() * (2.0 * PI * u2).cos()
+        };
+
+        let mut spectrum = vec![Complex::new(0.0, 0.0); n];
+        let mut filled = 0usize;
+        for k in 1..n / 2 {
+            let f = k as f64 * df;
+            if (f - self.frequency_mhz).abs() > half_bw {
+                continue;
+            }
+            let v = Complex::new(next_gaussian(), next_gaussian());
+            spectrum[k] = v;
+            if real_valued {
+                spectrum[n - k] = v.conj();
+            }
+            filled += 1;
+        }
+        if filled == 0 {
+            return;
+        }
+
+        // Scale so the channel carries the same power the carrier would have: a real tone of
+        // peak amplitude A has mean square A²/2, a complex one A².
+        let target = if real_valued { amp * amp / 2.0 } else { amp * amp };
+        // rustfft's inverse transform is unnormalised, so by Parseval the mean power it will
+        // produce is the plain sum of the bin powers.
+        let raw: f64 = spectrum.iter().map(|c| c.norm_sqr()).sum();
+        let scale = (target / raw.max(1e-300)).sqrt();
+
+        let mut buffer = spectrum;
+        FftPlanner::new().plan_fft_inverse(n).process(&mut buffer);
+
+        let phase_rad = self.phase_deg * PI / 180.0;
+        let rot = Complex::new(phase_rad.cos(), phase_rad.sin());
+        for (s, b) in samples.iter_mut().zip(buffer.iter()) {
+            let v = b * scale;
+            *s += if real_valued {
+                Complex::new(v.re, 0.0)
+            } else {
+                v * rot
+            };
+        }
+    }
 }
 
 /// Multi-tone signal generator with configurable noise floor.
@@ -147,6 +240,12 @@ impl SignalGenerator {
         for tone in &self.tones {
             let amp = tone.linear_amplitude();
             let phase_rad = tone.phase_deg * PI / 180.0;
+
+            // A carrier with a stated channel bandwidth is a modulated signal, not a line.
+            if tone.is_channel() {
+                tone.synthesise_channel(&mut samples, sample_rate_mhz, start_time_us);
+                continue;
+            }
 
             match &tone.modulation {
                 ToneModulation::SweptChirp { sweep_period_ms } => {
@@ -307,25 +406,36 @@ impl SignalGenerator {
             }
         }
 
-        // Add AWGN noise using Box-Muller transform
+        // Additive white Gaussian noise, Box-Muller from a xorshift stream.
+        //
+        // The noise goes into the real component only, because that is the one physical
+        // quantity a wire carries — and it is the only part the converter samples. Splitting
+        // it across I and Q instead put half the configured power somewhere that gets
+        // discarded, so the floor read 3 dB below its setting.
         if self.noise_enabled {
-            let noise_db = -self.noise_floor_dbfs.abs();
-            let noise_amp = 10.0_f64.powf(noise_db / 20.0);
+            let noise_amp = 10.0_f64.powf(self.noise_floor_dbfs / 20.0);
             let mut seed: u64 = 0xDEAD_BEEF_CAFE_BABE ^ (start_time_us.to_bits());
+            let mut spare: Option<f64> = None;
 
             for sample in &mut samples {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                let u1 = (seed as f64) / (u64::MAX as f64);
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                let u2 = (seed as f64) / (u64::MAX as f64);
-
-                let r = (-2.0 * u1.max(1e-300).ln()).sqrt();
-                let theta = 2.0 * PI * u2;
-                *sample += Complex::new(noise_amp * r * theta.cos(), noise_amp * r * theta.sin());
+                let g = match spare.take() {
+                    Some(v) => v,
+                    None => {
+                        let mut next_unit = || {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            (seed >> 11) as f64 / (1u64 << 53) as f64
+                        };
+                        let u1 = next_unit().max(1e-300);
+                        let u2 = next_unit();
+                        let r = (-2.0 * u1.ln()).sqrt();
+                        let theta = 2.0 * PI * u2;
+                        spare = Some(r * theta.sin());
+                        r * theta.cos()
+                    }
+                };
+                sample.re += noise_amp * g;
             }
         }
 
@@ -715,6 +825,89 @@ mod tests {
         assert_eq!(out_samples[9], Complex::new(4.0, 4.0));
 
         std::fs::remove_file(file_path).unwrap();
+    }
+
+    #[test]
+    fn channel_bandwidth_actually_occupies_the_band() {
+        use rustfft::FftPlanner;
+
+        let fs = 15000.0;
+        let n = 15000; // 3000 MHz lands exactly on a bin
+        for bw in [20.0, 100.0, 500.0] {
+            let sig_gen = SignalGenerator {
+                tones: vec![Tone {
+                    frequency_mhz: 3000.0,
+                    amplitude_dbfs: 0.0,
+                    phase_deg: 0.0,
+                    bandwidth_mhz: bw,
+                    modulation: ToneModulation::RealCosine,
+                }],
+                noise_floor_dbfs: -200.0,
+                noise_enabled: false,
+            };
+            let mut buf = sig_gen.generate(n, fs);
+            FftPlanner::new().plan_fft_forward(n).process(&mut buf);
+
+            // Total power, then the span that holds 99% of it around the carrier.
+            let mag: Vec<f64> = buf.iter().take(n / 2).map(|c| c.norm_sqr()).collect();
+            let total: f64 = mag.iter().sum();
+            let centre = (3000.0 / fs * n as f64).round() as usize;
+            let mut acc = mag[centre];
+            let mut half = 0usize;
+            while acc < 0.99 * total && half < n / 4 {
+                half += 1;
+                acc += mag.get(centre + half).copied().unwrap_or(0.0);
+                acc += mag.get(centre.saturating_sub(half)).copied().unwrap_or(0.0);
+            }
+            let occupied = 2.0 * half as f64 * fs / n as f64;
+            assert!(
+                occupied > 0.5 * bw && occupied < 2.0 * bw,
+                "asked for {bw} MHz, occupied {occupied:.1} MHz"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_bandwidth_is_still_a_pure_tone() {
+        use rustfft::FftPlanner;
+        let fs = 15000.0;
+        let n = 15000; // 3000 MHz lands exactly on a bin
+        let sig_gen = SignalGenerator {
+            tones: vec![Tone {
+                frequency_mhz: 3000.0,
+                amplitude_dbfs: 0.0,
+                phase_deg: 0.0,
+                bandwidth_mhz: 0.0,
+                modulation: ToneModulation::RealCosine,
+            }],
+            noise_floor_dbfs: -200.0,
+            noise_enabled: false,
+        };
+        let mut buf = sig_gen.generate(n, fs);
+        FftPlanner::new().plan_fft_forward(n).process(&mut buf);
+        let centre = (3000.0 / fs * n as f64).round() as usize;
+        let total: f64 = buf.iter().take(n / 2).map(|c| c.norm_sqr()).sum();
+        let in_bin: f64 = buf[centre - 1..=centre + 1].iter().map(|c| c.norm_sqr()).sum();
+        assert!(in_bin > 0.99 * total, "a pure tone should sit in one bin");
+    }
+
+    #[test]
+    fn noise_floor_lands_on_its_setting() {
+        // The configured floor is the total power of the real voltage, since that is the only
+        // part a wire carries and the only part the converter samples.
+        for floor in [-40.0, -80.0, -120.0] {
+            let sig_gen = SignalGenerator {
+                tones: vec![],
+                noise_floor_dbfs: floor,
+                noise_enabled: true,
+            };
+            let s = sig_gen.generate_at_time(1 << 15, 15000.0, 7.5);
+            let p: f64 = s.iter().map(|v| v.re * v.re).sum::<f64>() / s.len() as f64;
+            let db = 10.0 * p.log10();
+            assert!((db - floor).abs() < 0.5, "asked for {floor} dBFS, measured {db}");
+            let q: f64 = s.iter().map(|v| v.im.abs()).sum();
+            assert!(q < 1e-12, "the analog domain is real, but Q carried {q}");
+        }
     }
 
     #[test]

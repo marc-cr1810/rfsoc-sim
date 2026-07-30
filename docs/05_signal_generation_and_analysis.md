@@ -6,11 +6,11 @@ This document details how the simulator generates complex test vectors and how i
 
 To rigorously test the RFSoC datapath, the simulator includes a robust, wideband signal generator capable of producing multiple parallel waveforms. 
 
-1. **Continuous Wave (CW):** Produces pure real-valued sine tones.
+1. **Continuous Wave (CW):** Produces pure sine tones. Give a tone a non-zero **channel bandwidth** and it becomes a modulated channel instead of a line: the in-band FFT bins are filled with random phase and transformed back, which is what a real carrier with data on it looks like — flat, exactly the requested width, and carrying the same total power as the tone it replaces.
 2. **Frequency Modulation (FM):** Modulates the instantaneous frequency of the carrier.
 3. **Swept Chirps:** Linearly sweeps the frequency across a bandwidth over a given time period. This is essential for testing the transition bands of decimation filters.
 4. **Pulsed Radar:** Turns the signal on and off with a specified Duty Cycle and Pulse Repetition Interval (PRI).
-5. **AWGN Noise Floor:** Synthesizes an Additive White Gaussian Noise floor at a specific dBFS level to simulate thermal noise and dynamic range limitations.
+5. **AWGN Noise Floor:** Synthesizes an Additive White Gaussian Noise floor at a specific dBFS level, as a test vector for dynamic-range work. It goes into the real voltage only — the one quantity a wire carries, and the only part the converter samples — so the measured floor lands on its setting rather than 3 dB below it. Note this is a *total power* figure, so its on-screen level moves with FFT length; the chain's own **physical** noise is the $kTB$-based thermal model in `src/node_graph/components.rs`, which is properly a power spectral density.
 
 ### Time-Domain Continuity
 Crucially, the signal generator is fully time-aware. It uses a continuous phase accumulator tied to the global simulation time $t$. This ensures that when the simulator re-evaluates the pipeline, the generated signals do not suffer from phase discontinuities or spectral leakage artifacts caused by block-based processing.

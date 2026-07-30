@@ -1,8 +1,8 @@
 //! Main application state and eframe::App implementation.
 
 use crate::dsp::{self, ProcessedSignal};
-use crate::node_graph::nodes::RfNode;
-use crate::node_graph::viewer;
+use crate::node_graph::nodes::{ChainEnvironment, RfNode};
+use crate::node_graph::viewer::{self, GraphAnnotations};
 use crate::rfdc::RfdcConfig;
 use crate::signal::SignalGenerator;
 use crate::ui::{config_panel, nyquist_view, spectrum_view, theme::Theme, tile_overview};
@@ -13,6 +13,19 @@ use serde::{Deserialize, Serialize};
 struct SimulatorState {
     snarl: Snarl<RfNode>,
     rfdc: RfdcConfig,
+    #[serde(default)]
+    chain_env: ChainEnvironment,
+}
+
+/// Cascaded RF budget of the chain feeding the selected block.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainBudget {
+    pub gain_db: f64,
+    pub noise_figure_db: f64,
+    pub oip3_dbm: f64,
+    pub analysis_freq_mhz: f64,
+    pub compressing: bool,
+    pub has_cycle: bool,
 }
 
 /// The active tab in the main content area.
@@ -41,6 +54,12 @@ pub struct RfSocSimApp {
     pub auto_compute: bool,
     /// Signal generator (used when no node graph source is connected).
     pub signal_gen: SignalGenerator,
+    /// Physical environment of the RF chain: temperature and thermal noise.
+    pub chain_env: ChainEnvironment,
+    /// Cascaded budget of the chain, from the last evaluation.
+    pub chain_budget: Option<ChainBudget>,
+    /// Per-node annotations painted onto the graph.
+    pub graph_annotations: GraphAnnotations,
     /// Whether the theme has been applied.
     theme_applied: bool,
     /// Real-time simulation state (Play/Pause).
@@ -79,6 +98,9 @@ impl Default for RfSocSimApp {
             processed_signal: None,
             auto_compute: true,
             signal_gen: SignalGenerator::default(),
+            chain_env: ChainEnvironment::default(),
+            chain_budget: None,
+            graph_annotations: GraphAnnotations::default(),
             theme_applied: false,
             is_running: true,
             simulation_time_us: 0.0,
@@ -89,6 +111,163 @@ impl Default for RfSocSimApp {
 }
 
 impl RfSocSimApp {
+    /// Frequency of the strongest tone driving the graph, used as the RF budget's reference.
+    ///
+    /// A stage's gain, loss and noise figure all depend on frequency, so a cascaded figure
+    /// quoted at a fixed frequency says nothing useful about a chain carrying a signal
+    /// somewhere else — a 1 GHz low-pass looks lossless right up until the tone moves.
+    fn dominant_tone_mhz(&self) -> f64 {
+        let mut best: Option<(f64, f64)> = None; // (amplitude dBFS, frequency)
+        let mut consider = |source: &SignalGenerator| {
+            for tone in &source.tones {
+                if best.is_none_or(|(a, _)| tone.amplitude_dbfs > a) {
+                    best = Some((tone.amplitude_dbfs, tone.frequency_mhz));
+                }
+            }
+        };
+
+        // Local sources on the graph take priority over the global generator.
+        let mut saw_local = false;
+        for (_, node) in self.snarl.node_ids() {
+            if let RfNode::SignalSource(src) = node {
+                if matches!(
+                    src.source_type,
+                    crate::node_graph::nodes::SourceType::LocalGenerator
+                ) {
+                    consider(&src.generator);
+                    saw_local = true;
+                }
+            }
+        }
+        if !saw_local {
+            consider(&self.signal_gen);
+        }
+
+        best.map(|(_, f)| f).unwrap_or(1000.0).max(1.0)
+    }
+
+    /// Toolbar above the node graph: the chain's environment and its cascaded RF budget.
+    fn show_chain_toolbar(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(Theme::BG_CARD)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .corner_radius(6.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.chain_env.thermal_noise, "Thermal noise")
+                        .on_hover_text(
+                            "Each stage contributes (F-1)·G·kTB of its own noise, so where an \
+                             LNA sits in the chain changes the SNR reaching the converter.",
+                        );
+                    ui.add_enabled_ui(self.chain_env.thermal_noise, |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.chain_env.temperature_k)
+                                .range(4.0..=500.0)
+                                .suffix(" K")
+                                .speed(1.0),
+                        )
+                        .on_hover_text("Physical temperature of the chain. 290 K is the IEEE reference.");
+                    });
+
+                    ui.separator();
+
+                    match self.chain_budget {
+                        Some(b) => {
+                            let metric = |ui: &mut egui::Ui,
+                                          label: &str,
+                                          value: String,
+                                          color: egui::Color32,
+                                          hover: &str| {
+                                ui.label(
+                                    egui::RichText::new(label)
+                                        .small()
+                                        .color(Theme::TEXT_SECONDARY),
+                                );
+                                ui.label(egui::RichText::new(value).strong().color(color))
+                                    .on_hover_text(hover);
+                                ui.add_space(6.0);
+                            };
+
+                            metric(
+                                ui,
+                                "Gain",
+                                format!("{:+.2} dB", b.gain_db),
+                                Theme::TEXT_PRIMARY,
+                                "Cascaded gain of every stage feeding the selected ADC block.",
+                            );
+                            metric(
+                                ui,
+                                "NF",
+                                format!("{:.2} dB", b.noise_figure_db),
+                                if b.noise_figure_db > 10.0 {
+                                    Theme::ACCENT_WARN
+                                } else {
+                                    Theme::ACCENT_SECONDARY
+                                },
+                                "Friis cascaded noise figure. The first stage dominates, which \
+                                 is why an LNA belongs as close to the antenna as possible.",
+                            );
+                            metric(
+                                ui,
+                                "OIP3",
+                                if b.oip3_dbm.is_finite() {
+                                    format!("{:+.1} dBm", b.oip3_dbm)
+                                } else {
+                                    "linear".to_string()
+                                },
+                                Theme::TEXT_PRIMARY,
+                                "Cascaded output third-order intercept. Passive stages are taken \
+                                 as ideally linear and do not degrade it.",
+                            );
+                            metric(
+                                ui,
+                                "@",
+                                format!("{:.0} MHz", b.analysis_freq_mhz),
+                                Theme::ACCENT_PRIMARY,
+                                "The budget above is evaluated here, at the strongest tone \
+                                 driving the chain.",
+                            );
+
+                            if b.compressing {
+                                ui.label(
+                                    egui::RichText::new("⚠ stage compressing")
+                                        .strong()
+                                        .color(Theme::ACCENT_WARN),
+                                )
+                                .on_hover_text(
+                                    "A stage is more than 1 dB into compression. Reduce the \
+                                     drive level or raise its P1dB.",
+                                );
+                            }
+                            if b.has_cycle {
+                                ui.label(
+                                    egui::RichText::new("⚠ feedback loop")
+                                        .strong()
+                                        .color(Theme::ACCENT_ERROR),
+                                )
+                                .on_hover_text(
+                                    "Part of the graph is wired in a loop and cannot be \
+                                     evaluated by a forward-only chain model.",
+                                );
+                            }
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "No chain reaches Tile {} Block {} — add an ADC Input node \
+                                     and wire a source to it",
+                                    self.selected_tile, self.selected_block
+                                ))
+                                .small()
+                                .color(Theme::ACCENT_WARN),
+                            );
+                        }
+                    }
+                });
+            });
+        ui.add_space(4.0);
+    }
+
     /// Recompute the processed signal for the selected tile/block at current simulation time.
     fn recompute_signal(&mut self) {
         let tile = &self.rfdc.adc_tiles[self.selected_tile];
@@ -114,6 +293,10 @@ impl RfSocSimApp {
             ((needed_tile_samples as f64 * oversampling).ceil() as usize).clamp(4096, 131_072),
         );
 
+        // The RF budget is only meaningful at a frequency, so report it where the signal
+        // actually is: the strongest tone driving this chain.
+        self.chain_env.analysis_freq_mhz = self.dominant_tone_mhz();
+
         let graph_res = crate::node_graph::nodes::evaluate_graph(
             &self.snarl,
             self.selected_tile,
@@ -122,14 +305,35 @@ impl RfSocSimApp {
             input_sample_rate_mhz,
             &self.signal_gen,
             self.simulation_time_us,
+            &self.chain_env,
         );
 
         let (samples, rf_chain_response) = match graph_res {
-            Some(res) => (
-                res.samples,
-                Some((res.rf_chain_response_db, res.rf_chain_freq_axis_mhz)),
-            ),
+            Some(res) => {
+                self.chain_budget = Some(ChainBudget {
+                    gain_db: res.cascaded_gain_db,
+                    noise_figure_db: res.cascaded_nf_db,
+                    oip3_dbm: res.cascaded_oip3_dbm,
+                    analysis_freq_mhz: res.analysis_freq_mhz,
+                    compressing: res.compressing,
+                    has_cycle: !res.cycle_nodes.is_empty(),
+                });
+                self.graph_annotations = GraphAnnotations {
+                    stats: res.node_stats,
+                    cycle_nodes: res.cycle_nodes,
+                    analysis_freq_mhz: res.analysis_freq_mhz,
+                };
+                (
+                    res.samples,
+                    Some((res.rf_chain_response_db, res.rf_chain_freq_axis_mhz)),
+                )
+            }
             None => {
+                self.chain_budget = None;
+                self.graph_annotations = GraphAnnotations {
+                    analysis_freq_mhz: self.chain_env.analysis_freq_mhz,
+                    ..Default::default()
+                };
                 let empty_gen = SignalGenerator {
                     tones: vec![],
                     noise_floor_dbfs: self.signal_gen.noise_floor_dbfs,
@@ -218,6 +422,7 @@ impl eframe::App for RfSocSimApp {
                                 if let Ok(state) = serde_json::from_str::<SimulatorState>(&content) {
                                     self.snarl = state.snarl;
                                     self.rfdc = state.rfdc;
+                                    self.chain_env = state.chain_env;
                                     self.recompute_signal();
                                 }
                             }
@@ -232,6 +437,7 @@ impl eframe::App for RfSocSimApp {
                             let state = SimulatorState {
                                 snarl: self.snarl.clone(),
                                 rfdc: self.rfdc.clone(),
+                                chain_env: self.chain_env,
                             };
                             if let Ok(content) = serde_json::to_string_pretty(&state) {
                                 let _ = std::fs::write(&path, content);
@@ -303,7 +509,7 @@ impl eframe::App for RfSocSimApp {
                         if ui.button("+").clicked() {
                             sig.tones.push(crate::signal::Tone::default());
                         }
-                        if sig.tones.len() > 1 && ui.button("−").clicked() {
+                        if sig.tones.len() > 1 && ui.button("-").clicked() {
                             sig.tones.pop();
                         }
                     });
@@ -512,7 +718,8 @@ impl eframe::App for RfSocSimApp {
                 });
             }
             Tab::RfChain => {
-                viewer::show_node_graph(ui, &mut self.snarl);
+                self.show_chain_toolbar(ui);
+                viewer::show_node_graph(ui, &mut self.snarl, &self.graph_annotations);
             }
             Tab::Spectrum => {
                 egui::ScrollArea::vertical().show(ui, |ui| {

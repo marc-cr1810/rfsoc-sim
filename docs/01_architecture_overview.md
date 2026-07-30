@@ -25,7 +25,7 @@ graph LR
 ### 1. The Analog Domain (Physical Continuous Time)
 * **Code Location:** `src/signal.rs`, `src/node_graph/*`
 * **Concept:** In the real world, antennas and cables carry continuous RF voltages. To simulate this accurately without infinite memory, the simulator mathematically evaluates the signal at an extremely high sample rate (e.g., $15 \text{ GHz}$ or higher). 
-* **Mechanics:** The signal generator produces pure, **Real-valued** voltage waveforms (e.g., Continuous Wave, FM, Chirps). These real waveforms are passed through the visual Node Graph, which models physical RF components like filters, attenuators, and baluns using S-parameter (Touchstone) matrices and cascaded Friis equations.
+* **Mechanics:** The signal generator produces voltage waveforms (e.g., Continuous Wave, FM, Chirps), collapsed to a **real voltage at the source node** — an antenna or a cable carries one real quantity, and every component downstream is a conjugate-symmetric two-port that keeps it real. These waveforms pass through the visual Node Graph, which models physical RF components like filters, attenuators, and baluns using pole prototypes, S-parameter (Touchstone) data and cascaded Friis equations. Noise figures inject real noise rather than only being reported, so where an LNA sits in the chain changes the SNR that reaches the converter.
 
 ### 2. The Digital Domain (Discrete Time)
 * **Code Location:** `src/rfdc.rs`, `src/dsp.rs`
