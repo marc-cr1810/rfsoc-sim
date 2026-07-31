@@ -20,6 +20,101 @@ struct SimulatorState {
 /// Wideband simulation rate in MHz, high enough to carry signals up to 7.5 GHz.
 pub const SIM_SAMPLE_RATE_MHZ: f64 = 15000.0;
 
+/// Everything one capture needs, owned, so it can cross to the worker thread.
+///
+/// Cloned per request rather than shared behind a lock: the configuration is a few kilobytes
+/// and the UI stays free to edit it while a capture is in flight, which a lock would not allow.
+struct CaptureRequest {
+    snarl: Snarl<RfNode>,
+    tile: crate::rfdc::AdcTile,
+    block: crate::rfdc::AdcBlock,
+    signal_gen: SignalGenerator,
+    chain_env: ChainEnvironment,
+    selected_tile: usize,
+    selected_block: usize,
+    time_us: f64,
+    analysis: dsp::SpectrumAnalysis,
+    /// Whether the spectrum panes are on screen. When they are not, the ADC pipeline is skipped
+    /// and only the graph runs, for the budget and the node annotations.
+    spectrum_visible: bool,
+    sequence: u64,
+    /// Woken when the result is ready, so a paused simulation still repaints to show it.
+    ctx: egui::Context,
+}
+
+/// What one capture produced.
+struct CaptureResponse {
+    /// `None` when the spectrum panes were not on screen, or the tile/block is disabled.
+    processed: Option<ProcessedSignal>,
+    chain_budget: Option<ChainBudget>,
+    graph_annotations: GraphAnnotations,
+    cost: std::time::Duration,
+}
+
+/// Handle to the thread that runs the signal pipeline.
+///
+/// A capture costs tens of milliseconds at high resolution, which is several frames' worth; run
+/// on the UI thread it stalls rendering and input for that whole time. Off it, the UI keeps
+/// painting at full rate and captures simply land when they land. At most one is in flight —
+/// there is no point queueing work whose result would be stale on arrival — so requests made
+/// while the worker is busy are dropped, and the next frame asks again.
+struct CaptureWorker {
+    tx: std::sync::mpsc::Sender<CaptureRequest>,
+    rx: std::sync::mpsc::Receiver<CaptureResponse>,
+    in_flight: bool,
+}
+
+impl CaptureWorker {
+    fn spawn() -> Self {
+        let (tx, req_rx) = std::sync::mpsc::channel::<CaptureRequest>();
+        let (resp_tx, rx) = std::sync::mpsc::channel::<CaptureResponse>();
+
+        std::thread::Builder::new()
+            .name("rfsoc-capture".into())
+            .spawn(move || {
+                // Ends when the app drops its sender.
+                while let Ok(request) = req_rx.recv() {
+                    let ctx = request.ctx.clone();
+                    let started = std::time::Instant::now();
+                    let mut response = run_capture(request);
+                    response.cost = started.elapsed();
+                    if resp_tx.send(response).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+            })
+            .expect("failed to spawn the capture worker thread");
+
+        Self { tx, rx, in_flight: false }
+    }
+
+    /// Send a capture to the worker, unless one is already running.
+    fn dispatch(&mut self, request: CaptureRequest) {
+        if self.in_flight {
+            return;
+        }
+        if self.tx.send(request).is_ok() {
+            self.in_flight = true;
+        }
+    }
+
+    /// Take a finished capture, if one has arrived.
+    fn poll(&mut self) -> Option<CaptureResponse> {
+        match self.rx.try_recv() {
+            Ok(response) => {
+                self.in_flight = false;
+                Some(response)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.in_flight = false;
+                None
+            }
+        }
+    }
+}
+
 /// Cascaded RF budget of the chain feeding the selected block.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainBudget {
@@ -58,6 +153,16 @@ pub struct RfSocSimApp {
     /// FFT window used for every displayed spectrum. A display choice, not hardware — it
     /// trades main-lobe width against how far a tone's leakage skirt spreads across the trace.
     pub display_window: dsp::FftWindow,
+    /// How finely the post-DDC spectrum is resolved. Trades resolution bandwidth against how
+    /// much wideband signal has to be generated per capture, and so how often one lands.
+    pub spectrum_detail: dsp::SpectrumDetail,
+    /// Counter stamped onto each `ProcessedSignal` so the waterfall can tell a new capture from
+    /// a repaint of the previous one.
+    signal_sequence: u64,
+    /// Background thread the signal pipeline runs on.
+    worker: CaptureWorker,
+    /// How long the last capture took, for the status readout.
+    last_capture_cost: std::time::Duration,
     /// Signal generator (used when no node graph source is connected).
     pub signal_gen: SignalGenerator,
     /// Physical environment of the RF chain: temperature and thermal noise.
@@ -104,6 +209,10 @@ impl Default for RfSocSimApp {
             processed_signal: None,
             auto_compute: true,
             display_window: dsp::DEFAULT_DISPLAY_WINDOW,
+            spectrum_detail: dsp::SpectrumDetail::default(),
+            signal_sequence: 0,
+            worker: CaptureWorker::spawn(),
+            last_capture_cost: std::time::Duration::ZERO,
             signal_gen: SignalGenerator::default(),
             chain_env: ChainEnvironment::default(),
             chain_budget: None,
@@ -275,96 +384,193 @@ impl RfSocSimApp {
         ui.add_space(4.0);
     }
 
-    /// Recompute the processed signal for the selected tile/block at current simulation time.
-    fn recompute_signal(&mut self) {
+    /// Build a capture request for the current state, or `None` if nothing needs computing.
+    fn capture_request(&self, ctx: &egui::Context, sequence: u64) -> Option<CaptureRequest> {
         let tile = &self.rfdc.adc_tiles[self.selected_tile];
-        if !tile.enabled {
-            self.processed_signal = None;
-            return;
-        }
-
         let block = &tile.blocks[self.selected_block];
-        if !block.enabled {
+        if !tile.enabled || !block.enabled {
+            return None;
+        }
+
+        let mut chain_env = self.chain_env;
+        // The RF budget is only meaningful at a frequency, so report it where the signal
+        // actually is: the strongest tone driving this chain. Cheap, and it needs the graph,
+        // so it stays on this side.
+        chain_env.analysis_freq_mhz = self.dominant_tone_mhz();
+
+        Some(CaptureRequest {
+            snarl: self.snarl.clone(),
+            tile: tile.clone(),
+            block: block.clone(),
+            signal_gen: self.signal_gen.clone(),
+            chain_env,
+            selected_tile: self.selected_tile,
+            selected_block: self.selected_block,
+            time_us: self.simulation_time_us,
+            analysis: dsp::SpectrumAnalysis {
+                window: self.display_window,
+                detail: self.spectrum_detail,
+            },
+            spectrum_visible: self.active_tab == Tab::Spectrum,
+            sequence,
+            ctx: ctx.clone(),
+        })
+    }
+
+    /// Ask the worker for a capture of the current state, if it is free to take one.
+    fn request_capture(&mut self, ctx: &egui::Context) {
+        // Checked before building the request, not after: assembling one clones the node graph
+        // and the converter config, and this is called every frame while the worker is busy for
+        // most of them.
+        if self.worker.in_flight {
+            return;
+        }
+
+        let tile = &self.rfdc.adc_tiles[self.selected_tile];
+        if !tile.enabled || !tile.blocks[self.selected_block].enabled {
             self.processed_signal = None;
             return;
         }
 
-        let input_sample_rate_mhz = SIM_SAMPLE_RATE_MHZ;
+        self.signal_sequence += 1;
+        let sequence = self.signal_sequence;
+        if let Some(request) = self.capture_request(ctx, sequence) {
+            self.worker.dispatch(request);
+        }
+    }
 
-        // The ADC-rate and DDC FFTs consume samples at the *tile* rate, so the wideband
-        // buffer has to be scaled by the oversampling ratio — sizing it in wideband samples
-        // starves those FFTs of resolution whenever Fs is well below the simulation rate.
-        let oversampling = (input_sample_rate_mhz / tile.sample_rate_mhz().max(1.0)).max(1.0);
-        let needed_tile_samples = dsp::required_tile_samples(block.decimation.factor());
-        let num_samples = dsp::next_smooth_size(
-            ((needed_tile_samples as f64 * oversampling).ceil() as usize).clamp(4096, 131_072),
-        );
+    /// Fold a finished capture into the app state.
+    fn apply_capture(&mut self, response: CaptureResponse) {
+        self.last_capture_cost = response.cost;
+        self.chain_budget = response.chain_budget;
+        self.graph_annotations = response.graph_annotations;
+        // A capture taken while the spectrum was hidden carries no signal; the previous one
+        // stays put so returning to the tab finds its waterfall history intact.
+        if let Some(processed) = response.processed {
+            self.processed_signal = Some(processed);
+        }
+    }
+}
 
-        // The RF budget is only meaningful at a frequency, so report it where the signal
-        // actually is: the strongest tone driving this chain.
-        self.chain_env.analysis_freq_mhz = self.dominant_tone_mhz();
+/// Run one capture. This is the whole signal pipeline, and it runs on the worker thread.
+fn run_capture(request: CaptureRequest) -> CaptureResponse {
+    let CaptureRequest {
+        snarl,
+        tile,
+        block,
+        signal_gen,
+        chain_env,
+        selected_tile,
+        selected_block,
+        time_us,
+        analysis,
+        spectrum_visible,
+        sequence,
+        ctx: _,
+    } = request;
 
-        let graph_res = crate::node_graph::nodes::evaluate_graph(
-            &self.snarl,
-            self.selected_tile,
-            self.selected_block,
-            num_samples,
-            input_sample_rate_mhz,
-            &self.signal_gen,
-            self.simulation_time_us,
-            &self.chain_env,
-        );
+    let input_sample_rate_mhz = SIM_SAMPLE_RATE_MHZ;
 
-        let (samples, rf_chain_response) = match graph_res {
-            Some(res) => {
-                self.chain_budget = Some(ChainBudget {
-                    gain_db: res.cascaded_gain_db,
-                    noise_figure_db: res.cascaded_nf_db,
-                    oip3_dbm: res.cascaded_oip3_dbm,
-                    analysis_freq_mhz: res.analysis_freq_mhz,
-                    compressing: res.compressing,
-                    has_cycle: !res.cycle_nodes.is_empty(),
-                });
-                self.graph_annotations = GraphAnnotations {
-                    stats: res.node_stats,
-                    cycle_nodes: res.cycle_nodes,
-                    analysis_freq_mhz: res.analysis_freq_mhz,
-                };
-                (
-                    res.samples,
-                    Some((res.rf_chain_response_db, res.rf_chain_freq_axis_mhz)),
-                )
-            }
-            None => {
-                self.chain_budget = None;
-                self.graph_annotations = GraphAnnotations {
-                    analysis_freq_mhz: self.chain_env.analysis_freq_mhz,
-                    ..Default::default()
-                };
-                let empty_gen = SignalGenerator {
-                    tones: vec![],
-                    noise_floor_dbfs: self.signal_gen.noise_floor_dbfs,
-                    noise_enabled: self.signal_gen.noise_enabled,
-                };
-                (
-                    empty_gen.generate_at_time(num_samples, input_sample_rate_mhz, self.simulation_time_us),
-                    None,
-                )
-            }
+    // The ADC-rate and DDC FFTs consume samples at the *tile* rate, so the wideband
+    // buffer has to be scaled by the oversampling ratio — sizing it in wideband samples
+    // starves those FFTs of resolution whenever Fs is well below the simulation rate.
+    let oversampling = (input_sample_rate_mhz / tile.sample_rate_mhz().max(1.0)).max(1.0);
+    // The ADC pipeline exists to feed the spectrum panes, and nothing else reads
+    // `processed_signal`. The graph still has to run on every tab — the chain budget and
+    // the node annotations come from it — but sizing the capture for a DDC output nobody
+    // is looking at costs tens of milliseconds for a result that is discarded.
+    // Node stats are power figures, independent of block length (see
+    // `filtered_output_is_independent_of_block_length`), so a short capture serves them.
+    let needed_tile_samples = if spectrum_visible {
+        dsp::required_tile_samples(block.decimation.factor(), analysis.detail)
+    } else {
+        dsp::required_tile_samples(1, dsp::SpectrumDetail::Fast)
+    };
+    let num_samples = dsp::next_smooth_size(
+        ((needed_tile_samples as f64 * oversampling).ceil() as usize)
+            .clamp(4096, dsp::MAX_WIDEBAND_SAMPLES),
+    );
+
+    let graph_res = crate::node_graph::nodes::evaluate_graph(
+        &snarl,
+        selected_tile,
+        selected_block,
+        num_samples,
+        input_sample_rate_mhz,
+        &signal_gen,
+        time_us,
+        &chain_env,
+    );
+
+    let mut chain_budget = None;
+    let graph_annotations;
+
+    let (samples, source_samples, rf_chain_response) = match graph_res {
+        Some(res) => {
+            chain_budget = Some(ChainBudget {
+                gain_db: res.cascaded_gain_db,
+                noise_figure_db: res.cascaded_nf_db,
+                oip3_dbm: res.cascaded_oip3_dbm,
+                analysis_freq_mhz: res.analysis_freq_mhz,
+                compressing: res.compressing,
+                has_cycle: !res.cycle_nodes.is_empty(),
+            });
+            graph_annotations = GraphAnnotations {
+                stats: res.node_stats,
+                cycle_nodes: res.cycle_nodes,
+                analysis_freq_mhz: res.analysis_freq_mhz,
+            };
+            (
+                res.samples,
+                res.source_samples,
+                Some((res.rf_chain_response_db, res.rf_chain_freq_axis_mhz)),
+            )
+        }
+        None => {
+            graph_annotations = GraphAnnotations {
+                analysis_freq_mhz: chain_env.analysis_freq_mhz,
+                ..Default::default()
+            };
+            let empty_gen = SignalGenerator {
+                tones: vec![],
+                noise_floor_dbfs: signal_gen.noise_floor_dbfs,
+                noise_enabled: signal_gen.noise_enabled,
+            };
+            // No graph reaches this block, so there is no source to reference either.
+            (
+                empty_gen.generate_at_time(num_samples, input_sample_rate_mhz, time_us),
+                Vec::new(),
+                None,
+            )
+        }
+    };
+
+    if !spectrum_visible {
+        return CaptureResponse {
+            processed: None,
+            chain_budget,
+            graph_annotations,
+            cost: std::time::Duration::ZERO,
         };
+    }
 
-        let raw_samples = self.signal_gen.generate_at_time(num_samples, input_sample_rate_mhz, self.simulation_time_us);
+    // Process through ADC chain
+    let mut processed = dsp::process_adc_block(
+        &samples,
+        input_sample_rate_mhz,
+        &block,
+        &tile,
+        (!source_samples.is_empty()).then_some(source_samples.as_slice()),
+        rf_chain_response,
+        analysis,
+    );
+    processed.sequence = sequence;
 
-        // Process through ADC chain
-        self.processed_signal = Some(dsp::process_adc_block(
-            &samples,
-            input_sample_rate_mhz,
-            block,
-            tile,
-            Some(&raw_samples),
-            rf_chain_response,
-            self.display_window,
-        ));
+    CaptureResponse {
+        processed: Some(processed),
+        chain_budget,
+        graph_annotations,
+        cost: std::time::Duration::ZERO,
     }
 }
 
@@ -388,9 +594,15 @@ impl eframe::App for RfSocSimApp {
         }
         self.last_update_instant = Some(now);
 
-        // Auto-recompute
+        // Collect whatever the worker finished since the last frame, then ask for the next.
+        // The worker takes one capture at a time, so this self-paces: captures land as fast as
+        // the pipeline can produce them and never hold up a frame.
+        while let Some(response) = self.worker.poll() {
+            self.apply_capture(response);
+        }
         if self.auto_compute {
-            self.recompute_signal();
+            let ctx = ui.ctx().clone();
+            self.request_capture(&ctx);
         }
 
         // Top panel with tabs and realtime simulation controls
@@ -413,10 +625,27 @@ impl eframe::App for RfSocSimApp {
                 ui.selectable_value(&mut self.active_tab, Tab::Spectrum, "📊 Spectrum");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Captures run off the UI thread, so their rate is decoupled from the frame
+                    // rate and worth showing: it is what the waterfall's scroll speed tracks.
+                    let cost_ms = self.last_capture_cost.as_secs_f64() * 1000.0;
+                    if cost_ms > 0.0 {
+                        ui.colored_label(
+                            Theme::TEXT_SECONDARY,
+                            format!("{:.0} captures/s ({cost_ms:.0} ms)", 1000.0 / cost_ms),
+                        )
+                        .on_hover_text(
+                            "How fast the signal pipeline is producing captures on its worker \
+                             thread. Independent of the display frame rate — lowering the \
+                             spectrum resolution or the decimation factor raises it.",
+                        );
+                        ui.separator();
+                    }
+
                     ui.checkbox(&mut self.auto_compute, "Auto-compute");
 
                     if ui.button("🔄 Recompute").clicked() {
-                        self.recompute_signal();
+                        let ctx = ui.ctx().clone();
+                        self.request_capture(&ctx);
                     }
 
                     ui.separator();
@@ -431,7 +660,8 @@ impl eframe::App for RfSocSimApp {
                                     self.snarl = state.snarl;
                                     self.rfdc = state.rfdc;
                                     self.chain_env = state.chain_env;
-                                    self.recompute_signal();
+                                    let ctx = ui.ctx().clone();
+                                    self.request_capture(&ctx);
                                 }
                             }
                         }
@@ -473,7 +703,8 @@ impl eframe::App for RfSocSimApp {
 
                     if !self.is_running && ui.button("⏭ Step").clicked() {
                         self.simulation_time_us += 10_000.0 * self.sim_speed; // step 10 ms
-                        self.recompute_signal();
+                        let ctx = ui.ctx().clone();
+                        self.request_capture(&ctx);
                     }
 
                     let play_label = if self.is_running { "⏸ Pause" } else { "▶ Play" };
@@ -560,14 +791,107 @@ impl eframe::App for RfSocSimApp {
                         &self.processed_signal,
                         fs_mhz,
                         &mut self.display_window,
+                        &mut self.spectrum_detail,
                     );
                 });
             }
         }
 
-        // Auto-compute already refreshes every frame; this covers the manual case.
-        if window_changed && !self.auto_compute {
-            self.recompute_signal();
+        // Changing the analysis settings should be reflected as soon as the worker is free,
+        // even with auto-compute off.
+        if window_changed {
+            let ctx = ui.ctx().clone();
+            self.request_capture(&ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capture pipeline runs on its own thread, so everything crossing to it has to stay
+    /// `Send`. An `Rc` anywhere in the node graph or the converter config would break that, and
+    /// the error would land far from the cause — so it is checked here, at the boundary.
+    #[test]
+    fn capture_inputs_and_outputs_are_send() {
+        fn assert_send<T: Send + 'static>() {}
+        assert_send::<CaptureRequest>();
+        assert_send::<CaptureResponse>();
+        assert_send::<Snarl<RfNode>>();
+        assert_send::<RfdcConfig>();
+        assert_send::<SignalGenerator>();
+        assert_send::<ChainEnvironment>();
+        assert_send::<ProcessedSignal>();
+        assert_send::<GraphAnnotations>();
+    }
+
+    /// A capture makes it to the worker and back, carrying its sequence number, and the worker
+    /// is free to take another afterwards.
+    #[test]
+    fn worker_round_trips_a_capture() {
+        let app = RfSocSimApp::default();
+        let ctx = egui::Context::default();
+
+        let mut worker = CaptureWorker::spawn();
+        let request = app
+            .capture_request(&ctx, 42)
+            .expect("the default configuration has an enabled tile and block");
+        worker.dispatch(request);
+        assert!(worker.in_flight, "dispatch should mark the worker busy");
+
+        // Spin rather than sleep a fixed time, so a slow machine does not flake.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let response = loop {
+            if let Some(response) = worker.poll() {
+                break response;
+            }
+            assert!(std::time::Instant::now() < deadline, "worker never answered");
+            std::thread::yield_now();
+        };
+
+        assert!(!worker.in_flight, "polling a result should free the worker");
+        // The default tab is not the spectrum, so only the graph ran.
+        assert!(response.processed.is_none());
+        assert!(response.chain_budget.is_some(), "the default graph reaches the ADC");
+
+        // And on the spectrum tab the capture comes back stamped with its sequence.
+        let mut app = app;
+        app.active_tab = Tab::Spectrum;
+        worker.dispatch(app.capture_request(&ctx, 43).unwrap());
+        let response = loop {
+            if let Some(response) = worker.poll() {
+                break response;
+            }
+            assert!(std::time::Instant::now() < deadline, "worker never answered");
+            std::thread::yield_now();
+        };
+        let processed = response.processed.expect("spectrum tab should produce a capture");
+        assert_eq!(processed.sequence, 43);
+        assert!(!processed.output_spectrum_dbfs.is_empty());
+    }
+
+    /// Requests made while the worker is busy are dropped rather than queued, so a slow
+    /// pipeline cannot build a backlog of captures that are stale by the time they run.
+    #[test]
+    fn dispatch_while_busy_is_dropped() {
+        let app = RfSocSimApp::default();
+        let ctx = egui::Context::default();
+        let mut worker = CaptureWorker::spawn();
+
+        worker.dispatch(app.capture_request(&ctx, 1).unwrap());
+        for seq in 2..=10 {
+            worker.dispatch(app.capture_request(&ctx, seq).unwrap());
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while worker.poll().is_none() {
+            assert!(std::time::Instant::now() < deadline, "worker never answered");
+            std::thread::yield_now();
+        }
+
+        // Exactly one capture was accepted, so nothing else is waiting behind it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(worker.poll().is_none(), "a queued capture came back; requests were not dropped");
     }
 }

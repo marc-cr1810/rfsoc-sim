@@ -50,10 +50,23 @@ pub struct ProcessedSignal {
     /// padding, so anything that reasons about how far apart two features really are — peak
     /// picking, marker readouts — has to use this rather than the point spacing.
     pub output_rbw_mhz: f64,
+    /// Samples the output transform actually consumed. Below the requested
+    /// [`SpectrumDetail::output_bins`] whenever the wideband sample budget could not supply a
+    /// long enough record, which is how the UI knows to say so rather than quietly under-deliver.
+    pub output_bins_analysed: usize,
+    /// Bin count the output transform asked for, before any budget clipping.
+    pub output_bins_requested: usize,
     /// Complex baseband output time-domain samples (for oscilloscope & constellation).
     pub output_time_samples: Vec<Complex<f64>>,
     /// True if the physical ADC waveform clipped at any point during this capture.
     pub overrange: bool,
+    /// Monotonic counter identifying this capture, assigned by the caller.
+    ///
+    /// The spectrum is recomputed on its own schedule rather than once per frame, so anything
+    /// accumulating history — the waterfall — needs to tell a genuinely new capture from a
+    /// repaint of the previous one. Sequence numbers do that; comparing the data would not,
+    /// since two consecutive captures of a static signal are legitimately identical.
+    pub sequence: u64,
 }
 
 // ...
@@ -217,14 +230,11 @@ pub fn apply_analog_bandwidth(
     });
 
     // Scale each bin by the analog response, treating bins above N/2 as negative frequencies.
-    for (i, bin) in buffer.iter_mut().enumerate() {
-        let k = if i <= n / 2 {
-            i as f64
-        } else {
-            i as f64 - n as f64
-        };
-        let freq_mhz = k * sample_rate_mhz / n as f64;
-        *bin *= afe.gain_linear(freq_mhz);
+    // The curve is real and even, and depends only on the bin grid and the AFE settings, so it
+    // is built once and reused rather than evaluated per bin per capture.
+    let gains = analog_bandwidth_gains(n, sample_rate_mhz, afe);
+    for (bin, &g) in buffer.iter_mut().zip(gains.iter()) {
+        *bin *= g;
     }
 
     FFT_PLANNER.with(|planner| {
@@ -232,8 +242,65 @@ pub fn apply_analog_bandwidth(
         ifft.process(&mut buffer);
     });
 
+    // In place: the caller wants the real voltage back, and at these lengths a second buffer
+    // is megabytes of pointless traffic.
     let norm = 1.0 / n as f64;
-    buffer.iter().map(|c| Complex::new(c.re * norm, 0.0)).collect()
+    for c in buffer.iter_mut() {
+        *c = Complex::new(c.re * norm, 0.0);
+    }
+    buffer
+}
+
+/// Identifies an analog-bandwidth gain curve: the bin grid, and the response over it.
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct AfeGainKey {
+    n: usize,
+    rate_bits: u64,
+    bandwidth_bits: u64,
+    order: u32,
+}
+
+thread_local! {
+    static AFE_GAINS: RefCell<Option<(AfeGainKey, std::rc::Rc<Vec<f64>>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Analog roll-off gain per FFT bin, memoised on the grid it was built for.
+fn analog_bandwidth_gains(
+    n: usize,
+    sample_rate_mhz: f64,
+    afe: &crate::rfdc::AnalogFrontEnd,
+) -> std::rc::Rc<Vec<f64>> {
+    let key = AfeGainKey {
+        n,
+        rate_bits: sample_rate_mhz.to_bits(),
+        bandwidth_bits: afe.bandwidth_ghz.to_bits(),
+        order: afe.order,
+    };
+
+    AFE_GAINS.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        if let Some((cached_key, values)) = slot.as_ref()
+            && *cached_key == key
+        {
+            return values.clone();
+        }
+
+        let values = std::rc::Rc::new(
+            (0..n)
+                .map(|i| {
+                    let k = if i <= n / 2 {
+                        i as f64
+                    } else {
+                        i as f64 - n as f64
+                    };
+                    afe.gain_linear(k * sample_rate_mhz / n as f64)
+                })
+                .collect::<Vec<f64>>(),
+        );
+        *slot = Some((key, values.clone()));
+        values
+    })
 }
 
 /// Apply analog hardware non-idealities (HD2/HD3 distortion) before sampling.
@@ -423,9 +490,9 @@ pub fn process_adc_block(
     tile: &AdcTile,
     raw_source_samples: Option<&[Complex<f64>]>,
     rf_chain_response: Option<(Vec<f64>, Vec<f64>)>,
-    display_window: FftWindow,
+    analysis: SpectrumAnalysis,
 ) -> ProcessedSignal {
-    let fft_size = ANALYSIS_FFT_SIZE;
+    let display_window = analysis.window;
     let fs_mhz = tile.sample_rate_mhz();
     let ms = &block.mixer_settings;
 
@@ -448,27 +515,32 @@ pub fn process_adc_block(
         apply_analog_bandwidth(&dsa_samples, input_sample_rate_mhz, &block.analog_front_end);
     let analog_samples = apply_analog_non_idealities(&afe_samples, &block.non_idealities);
 
+    // A high `detail` lengthens the capture for the DDC output's benefit; these panes look at
+    // the same samples, so they take whatever length is going. See `analysis_fft_size`.
+    let wide_fft = analysis_fft_size(analog_samples.len());
     // Every spectrum below is drawn, not measured, so each is interpolated up to
     // DISPLAY_FFT_SIZE points. See `display_pad_factor` for why the raw bins are not enough.
-    let analysis_pad = display_pad_factor(fft_size);
+    let wide_pad = display_pad_factor(wide_fft);
 
     // 2. Input spectrum (full wideband) — the real voltage at the ADC pin
     let (input_spectrum, input_freq) = compute_spectrum_positive_padded(
         &analog_samples,
-        fft_size,
+        wide_fft,
         input_sample_rate_mhz,
         display_window,
-        analysis_pad,
+        wide_pad,
     );
 
     let raw_source_spectrum_dbfs = raw_source_samples.map(|samples| {
         let real_source = physical_voltage(samples);
+        // Matched to the input pane's length: the two are drawn overlaid, and transforms of
+        // different lengths would put their noise floors at different levels.
         let (raw_spec, _) = compute_spectrum_positive_padded(
             &real_source,
-            fft_size,
+            wide_fft,
             input_sample_rate_mhz,
             display_window,
-            analysis_pad,
+            wide_pad,
         );
         raw_spec
     });
@@ -481,8 +553,10 @@ pub fn process_adc_block(
     let (tile_samples, overrange) = apply_digital_non_idealities(&tile_samples_analog, &block.non_idealities);
 
     // Folded spectrum: actual ADC digital output spectrum (0..Fs/2)
+    let tile_fft = analysis_fft_size(tile_samples.len());
+    let tile_pad = display_pad_factor(tile_fft);
     let (folded_spectrum, folded_freq) =
-        compute_spectrum_positive_padded(&tile_samples, fft_size, fs_mhz, display_window, analysis_pad);
+        compute_spectrum_positive_padded(&tile_samples, tile_fft, fs_mhz, display_window, tile_pad);
 
     let nco_freq = resolve_nco_freq(ms.freq, fs_mhz, block.nyquist_zone.is_even());
 
@@ -511,23 +585,16 @@ pub fn process_adc_block(
     // 4. Compute post-mixer spectrum (at ADC tile rate Fs)
     let complex_output = block.produces_complex_output();
     let (post_mixer_spectrum, post_mixer_freq) = if complex_output {
-        compute_spectrum_padded(&mixed_samples, fft_size, fs_mhz, display_window, analysis_pad)
+        compute_spectrum_padded(&mixed_samples, tile_fft, fs_mhz, display_window, tile_pad)
     } else {
-        compute_spectrum_positive_padded(&mixed_samples, fft_size, fs_mhz, display_window, analysis_pad)
+        compute_spectrum_positive_padded(&mixed_samples, tile_fft, fs_mhz, display_window, tile_pad)
     };
 
     // The decimation filter's window onto the post-mixer spectrum: everything outside it is
     // what the PL will *not* receive.
     let decim_factor = block.decimation.factor();
-    let decimation_response_db: Vec<f64> = if decim_factor > 1 {
-        let chain = decimation_chain(decim_factor);
-        post_mixer_freq
-            .iter()
-            .map(|&f| chain.response_db(f / fs_mhz))
-            .collect()
-    } else {
-        vec![0.0; post_mixer_freq.len()]
-    };
+    let decimation_response_db =
+        decimation_response_on_axis(decim_factor, fs_mhz, &post_mixer_freq);
 
     // 5. Apply QMC (Quadrature Modulation Correction) post-mixer, pre-decimation
     let qmc_samples = apply_qmc(&mixed_samples, &block.qmc_settings);
@@ -536,9 +603,13 @@ pub fn process_adc_block(
     let decimated = apply_decimation(&qmc_samples, decim_factor);
     let actual_output_rate = block.output_rate_mhz(tile.sample_rate_gsps);
 
-    // 6. Output spectrum
-    let out_fft = output_fft_size(decim_factor);
+    // 6. Output spectrum. The requested bin count is independent of `decim_factor` — the span
+    // shrank with decimation, so holding the bins fixed is what turns decimation into
+    // resolution. `required_tile_samples` is what makes the record long enough to honour it.
+    let out_fft = analysis.detail.output_bins();
     // Samples the output transform actually sees, matching what compute_spectrum_* will use.
+    // Short of `out_fft` when the wideband budget capped the capture; everything downstream
+    // reads the resolution off this rather than off the request.
     let out_analysed = (out_fft.min(decimated.len()) / 2) * 2;
     let out_pad = display_pad_factor(out_analysed);
     let output_rbw_mhz = if out_analysed > 0 {
@@ -575,8 +646,11 @@ pub fn process_adc_block(
         output_sample_rate_mhz: actual_output_rate,
         display_window,
         output_rbw_mhz,
+        output_bins_analysed: out_analysed,
+        output_bins_requested: out_fft,
         output_time_samples: decimated,
         overrange,
+        sequence: 0,
     }
 }
 
@@ -727,6 +801,59 @@ pub fn compute_spectrum_positive(
     compute_spectrum_positive_with_window(samples, fft_size, sample_rate_mhz, FftWindow::Hanning)
 }
 
+/// Half-width of the resampling kernel: 32-tap windowed sinc for >100 dB spur rejection.
+const RESAMPLER_RADIUS: isize = 16;
+
+/// Taps the kernel spans, centred on the sample below the requested position.
+const RESAMPLER_TAPS: usize = 2 * RESAMPLER_RADIUS as usize + 1;
+
+/// Fractional positions the kernel is tabulated at.
+///
+/// The kernel depends only on the fractional part of the sample position, so it can be built
+/// once instead of per output sample — which is worth doing: evaluated directly it costs four
+/// transcendentals per tap, and a capture at high decimation needs millions of taps.
+/// Intermediate phases are linearly interpolated between neighbours, which keeps the error far
+/// below the kernel's own spur floor rather than at the phase quantisation.
+const RESAMPLER_PHASES: usize = 4096;
+
+/// One windowed-sinc kernel per quantised fractional phase.
+fn resampler_kernels() -> &'static [[f64; RESAMPLER_TAPS]] {
+    static KERNELS: std::sync::OnceLock<Vec<[f64; RESAMPLER_TAPS]>> = std::sync::OnceLock::new();
+    KERNELS.get_or_init(|| {
+        // One phase past the end so the interpolation always has a right-hand neighbour.
+        (0..=RESAMPLER_PHASES)
+            .map(|p| {
+                let frac = p as f64 / RESAMPLER_PHASES as f64;
+                let mut taps = [0.0; RESAMPLER_TAPS];
+                for (j, tap) in taps.iter_mut().enumerate() {
+                    // Tap j sits at index `centre - RADIUS + j`, so it is this far from the
+                    // requested position.
+                    let dx = frac + RESAMPLER_RADIUS as f64 - j as f64;
+                    let abs_dx = dx.abs();
+
+                    let norm_x = abs_dx / (RESAMPLER_RADIUS as f64 + 1.0);
+                    if norm_x >= 1.0 {
+                        continue;
+                    }
+
+                    let sinc = if abs_dx < 1e-9 {
+                        1.0
+                    } else {
+                        (PI * dx).sin() / (PI * dx)
+                    };
+                    // Blackman-Harris window
+                    let w = 0.35875
+                        + 0.48829 * (PI * norm_x).cos()
+                        + 0.14128 * (2.0 * PI * norm_x).cos()
+                        + 0.01168 * (3.0 * PI * norm_x).cos();
+                    *tap = sinc * w;
+                }
+                taps
+            })
+            .collect()
+    })
+}
+
 /// Sample wideband physical real voltage signal v(t) at the ADC tile sample rate Fs.
 /// Uses a high-quality windowed sinc anti-aliasing interpolator to eliminate fractional
 /// sample rate resampling artifacts (spurs).
@@ -742,37 +869,43 @@ pub fn sample_adc_at_tile_rate(
     let num_samples = (wideband_samples.len() as f64 / ratio).floor() as usize;
     let mut sampled = Vec::with_capacity(num_samples);
 
-    let k_radius = 16isize; // 32-tap windowed sinc filter for >100 dB spur rejection
+    let kernels = resampler_kernels();
     let len = wideband_samples.len() as isize;
+    let mut taps = [0.0f64; RESAMPLER_TAPS];
 
     for n in 0..num_samples {
         let sample_pos = n as f64 * ratio;
         let center_idx = sample_pos.floor() as isize;
+        let frac = sample_pos - center_idx as f64;
 
+        // Blend the two nearest tabulated phases onto the exact fractional position.
+        let phase = frac * RESAMPLER_PHASES as f64;
+        let phase_idx = (phase.floor() as usize).min(RESAMPLER_PHASES - 1);
+        let t = phase - phase_idx as f64;
+        let (lo_k, hi_k) = (&kernels[phase_idx], &kernels[phase_idx + 1]);
+        for j in 0..RESAMPLER_TAPS {
+            taps[j] = lo_k[j] + t * (hi_k[j] - lo_k[j]);
+        }
+
+        let first = center_idx - RESAMPLER_RADIUS;
         let mut val = 0.0;
         let mut weight_sum = 0.0;
 
-        for k in (center_idx - k_radius)..=(center_idx + k_radius) {
-            if k >= 0 && k < len {
-                let dx = sample_pos - k as f64;
-                let abs_dx = dx.abs();
-
-                let sinc = if abs_dx < 1e-9 {
-                    1.0
-                } else {
-                    (PI * dx).sin() / (PI * dx)
-                };
-
-                let norm_x = abs_dx / (k_radius as f64 + 1.0);
-                if norm_x < 1.0 {
-                    // Blackman-Harris window
-                    let w = 0.35875
-                        + 0.48829 * (PI * norm_x).cos()
-                        + 0.14128 * (2.0 * PI * norm_x).cos()
-                        + 0.01168 * (3.0 * PI * norm_x).cos();
-                    let weight = sinc * w;
-                    val += wideband_samples[k as usize].re * weight;
-                    weight_sum += weight;
+        if first >= 0 && first + RESAMPLER_TAPS as isize <= len {
+            // Interior: every tap lands on a real sample.
+            let window = &wideband_samples[first as usize..first as usize + RESAMPLER_TAPS];
+            for (tap, s) in taps.iter().zip(window) {
+                val += s.re * tap;
+                weight_sum += tap;
+            }
+        } else {
+            // Near an edge, renormalise over the taps that landed inside the buffer, so the
+            // first and last few outputs keep unit gain rather than rolling off.
+            for (j, &tap) in taps.iter().enumerate() {
+                let k = first + j as isize;
+                if k >= 0 && k < len {
+                    val += wideband_samples[k as usize].re * tap;
+                    weight_sum += tap;
                 }
             }
         }
@@ -1046,6 +1179,62 @@ pub fn decimation_chain(factor: u32) -> std::rc::Rc<DecimationChain> {
     })
 }
 
+/// Identifies a decimation response curve: the cascade, and the axis it was sampled on.
+///
+/// The axis is uniform, so its ends and length pin it exactly.
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct DecimResponseKey {
+    factor: u32,
+    fs_bits: u64,
+    len: usize,
+    first_bits: u64,
+    last_bits: u64,
+}
+
+thread_local! {
+    static DECIM_RESPONSE: RefCell<Option<(DecimResponseKey, std::rc::Rc<Vec<f64>>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Composite decimation-filter response over `freq_axis`, memoised on the axis it was built for.
+///
+/// `response_db` costs a cosine per tap per point, and the post-mixer axis is thousands of
+/// points wide — tens of milliseconds per capture for a curve that only moves when the
+/// decimation factor, the sample rate, or the axis does. None of those change between the
+/// captures of a running simulation, so in practice this is computed once.
+fn decimation_response_on_axis(factor: u32, fs_mhz: f64, freq_axis: &[f64]) -> Vec<f64> {
+    if factor <= 1 {
+        return vec![0.0; freq_axis.len()];
+    }
+
+    let key = DecimResponseKey {
+        factor,
+        fs_bits: fs_mhz.to_bits(),
+        len: freq_axis.len(),
+        first_bits: freq_axis.first().copied().unwrap_or(0.0).to_bits(),
+        last_bits: freq_axis.last().copied().unwrap_or(0.0).to_bits(),
+    };
+
+    DECIM_RESPONSE.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        if let Some((cached_key, values)) = slot.as_ref()
+            && *cached_key == key
+        {
+            return values.as_ref().clone();
+        }
+
+        let chain = decimation_chain(factor);
+        let values: std::rc::Rc<Vec<f64>> = std::rc::Rc::new(
+            freq_axis
+                .iter()
+                .map(|&f| chain.response_db(f / fs_mhz))
+                .collect(),
+        );
+        *slot = Some((key, values.clone()));
+        values.as_ref().clone()
+    })
+}
+
 impl DecimationChain {
     /// Composite magnitude response in dB at `freq_norm` cycles/sample of the chain input.
     pub fn response_db(&self, freq_norm: f64) -> f64 {
@@ -1101,21 +1290,100 @@ impl DecimationChain {
     }
 }
 
-/// FFT length used for the ADC-rate spectra (input, folded, post-mixer).
+/// Shortest analysis FFT the ADC-rate spectra (input, folded, post-mixer) will use.
 pub const ANALYSIS_FFT_SIZE: usize = 2048;
 
-/// FFT length used for the DDC output spectrum at a given decimation factor.
+/// Longest analysis FFT the ADC-rate spectra will stretch to when the record allows it.
 ///
-/// The decimator only emits `ANALYSIS_FFT_SIZE / decimation` samples, so this is the real
-/// resolution bandwidth of the output pane and it coarsens with decimation — at ×40 the floor
-/// leaves 64 bins across the whole output span. Raising the floor means generating
-/// proportionally more wideband input (see `required_tile_samples`), which at ×40 costs more
-/// per frame than the rest of the pipeline put together, so it stays here.
+/// A high [`SpectrumDetail`] lengthens the capture for the DDC output's sake, and the ADC-rate
+/// panes are looking at the same samples. Using them costs one larger transform and no extra
+/// generation, so the wideband and folded views sharpen for free. Capped because past this the
+/// transform starts to cost more than it returns on a 160-pixel-tall plot.
+pub const ANALYSIS_FFT_MAX: usize = 16384;
+
+/// Largest transform the available record supports, within the analysis FFT bounds.
 ///
-/// This is resolution, not drawability: `DISPLAY_FFT_SIZE` separately interpolates whatever
-/// this yields up to a point count that can be drawn without collapsing to a hairline.
-pub fn output_fft_size(decimation: u32) -> usize {
-    (ANALYSIS_FFT_SIZE / decimation.max(1) as usize).max(64)
+/// Powers of two only, to stay on rustfft's radix-2 path.
+fn analysis_fft_size(available: usize) -> usize {
+    if available < ANALYSIS_FFT_SIZE {
+        return ANALYSIS_FFT_SIZE;
+    }
+    let mut n = ANALYSIS_FFT_SIZE;
+    while n * 2 <= available.min(ANALYSIS_FFT_MAX) {
+        n *= 2;
+    }
+    n
+}
+
+/// Ceiling on the wideband samples generated per capture, whatever [`SpectrumDetail`] asks for.
+///
+/// The wideband buffer runs at the simulation rate, so it is `SIM_SAMPLE_RATE / Fs` times longer
+/// than the record the DDC actually needs — a 3.75× multiplier at 4 GSPS, on top of the
+/// decimation factor. `Max` detail at ×40 would want ~4.9 M samples; this stops there and the
+/// output pane reports the coarser resolution it really achieved via `output_bins_analysed`.
+pub const MAX_WIDEBAND_SAMPLES: usize = 524_288;
+
+/// How finely the post-DDC output spectrum is resolved.
+///
+/// This is the real bin count of the output transform, held constant across decimation factors:
+/// the output span shrinks with `D` while the bins do not, so the resolution bandwidth
+/// `(Fs/D) / bins` *improves* with decimation, which is the point of a DDC. It costs
+/// proportionally more wideband input (see [`required_tile_samples`]), which is why it is the
+/// user's choice rather than a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SpectrumDetail {
+    Fast,
+    #[default]
+    Balanced,
+    Fine,
+    Max,
+}
+
+impl SpectrumDetail {
+    pub const ALL: [SpectrumDetail; 4] = [
+        SpectrumDetail::Fast,
+        SpectrumDetail::Balanced,
+        SpectrumDetail::Fine,
+        SpectrumDetail::Max,
+    ];
+
+    /// Real (unpadded) bins the output transform is asked for.
+    pub fn output_bins(self) -> usize {
+        match self {
+            SpectrumDetail::Fast => 512,
+            SpectrumDetail::Balanced => 2048,
+            SpectrumDetail::Fine => 8192,
+            SpectrumDetail::Max => 32768,
+        }
+    }
+}
+
+impl std::fmt::Display for SpectrumDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            SpectrumDetail::Fast => "Fast",
+            SpectrumDetail::Balanced => "Balanced",
+            SpectrumDetail::Fine => "Fine",
+            SpectrumDetail::Max => "Max",
+        };
+        write!(f, "{name} ({} bins)", self.output_bins())
+    }
+}
+
+/// How every spectrum in one capture is analysed. Both fields are display choices, not hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpectrumAnalysis {
+    pub window: FftWindow,
+    pub detail: SpectrumDetail,
+}
+
+impl Default for SpectrumAnalysis {
+    fn default() -> Self {
+        Self {
+            window: DEFAULT_DISPLAY_WINDOW,
+            detail: SpectrumDetail::default(),
+        }
+    }
 }
 
 /// Point count every spectrum is interpolated up to before it reaches a plot.
@@ -1146,20 +1414,71 @@ pub fn display_pad_factor(n: usize) -> usize {
     pad
 }
 
-/// Round `n` up to the next 5-smooth number (only factors of 2, 3 and 5).
+/// How much dearer a radix-3 or radix-5 stage is than a radix-2 one, per sample.
+///
+/// Measured on rustfft's f64 path over every 5-smooth length between 100k and 160k: per-sample
+/// cost runs from ~7.9 ns for a pure power of two to ~12.4 ns for `2·5⁷`, and tracks the
+/// exponents of 3 and 5 closely enough for a ranking heuristic. Normalised against radix-2.
+const RADIX3_PENALTY: f64 = 0.032;
+const RADIX5_PENALTY: f64 = 0.044;
+
+/// Share of the per-capture cost that scales with the transform's radix mix rather than just
+/// with the sample count.
+///
+/// The wideband buffer feeds two FFTs (forward and inverse, for the analog roll-off), but also
+/// signal generation, resampling and the non-idealities, which are all plainly linear in `n`.
+/// Roughly 30/70 at the sizes this runs at — so a length has to be *properly* faster to be
+/// worth extra samples, not merely a nicer factorisation.
+const FFT_COST_SHARE: f64 = 0.3;
+
+/// Candidate lengths considered above `n` before settling for the smallest.
+const SIZE_SEARCH_HEADROOM: f64 = 1.3;
+
+/// Relative cost of a capture of length `n`, or `None` if `n` is not 5-smooth.
+fn smooth_size_cost(n: usize) -> Option<f64> {
+    let mut m = n;
+    let mut e3 = 0u32;
+    let mut e5 = 0u32;
+    while m.is_multiple_of(2) {
+        m /= 2;
+    }
+    while m.is_multiple_of(3) {
+        m /= 3;
+        e3 += 1;
+    }
+    while m.is_multiple_of(5) {
+        m /= 5;
+        e5 += 1;
+    }
+    if m != 1 {
+        return None;
+    }
+    let radix_penalty = RADIX3_PENALTY * e3 as f64 + RADIX5_PENALTY * e5 as f64;
+    Some(n as f64 * (1.0 + FFT_COST_SHARE * radix_penalty))
+}
+
+/// Round `n` up to a 5-smooth length (only factors of 2, 3 and 5), preferring cheap ones.
 ///
 /// The wideband buffer feeds an FFT for the analog bandwidth roll-off, and an awkward length
-/// like 31·571 pushes rustfft onto its slow general-radix path. Rounding up costs a couple of
-/// percent in samples and buys back several milliseconds a frame.
+/// like 31·571 pushes rustfft onto its slow general-radix path. But not every smooth length is
+/// equally good either: the smallest one above `n` is often heavy in radix 5 — 125000 is
+/// `2³·5⁶` — and a slightly larger, more radix-2-friendly length transforms faster despite
+/// carrying more samples. This weighs both effects (see [`smooth_size_cost`]) across the
+/// candidates within [`SIZE_SEARCH_HEADROOM`] and takes the cheapest, falling back to the
+/// smallest smooth length when nothing better turns up.
 pub fn next_smooth_size(n: usize) -> usize {
     if n <= 1 {
         return 1;
     }
-    let mut best = usize::MAX;
+
+    let ceiling = ((n as f64) * SIZE_SEARCH_HEADROOM) as usize;
+    let mut smallest = usize::MAX;
+    let mut best: Option<(f64, usize)> = None;
+
     let mut p2 = 1usize;
-    while p2 < n.saturating_mul(2) {
+    while p2 <= ceiling {
         let mut p23 = p2;
-        while p23 < n.saturating_mul(2) {
+        while p23 <= ceiling {
             let mut cand = p23;
             while cand < n {
                 cand = match cand.checked_mul(5) {
@@ -1168,7 +1487,20 @@ pub fn next_smooth_size(n: usize) -> usize {
                 };
             }
             if cand >= n {
-                best = best.min(cand);
+                // Tracked even when it overshoots the band, so there is always a fallback.
+                smallest = smallest.min(cand);
+            }
+            // Walk the radix-5 ladder through the whole search band, not just its first rung.
+            while cand >= n && cand <= ceiling {
+                if let Some(cost) = smooth_size_cost(cand)
+                    && best.is_none_or(|(best_cost, _)| cost < best_cost)
+                {
+                    best = Some((cost, cand));
+                }
+                cand = match cand.checked_mul(5) {
+                    Some(v) => v,
+                    None => break,
+                };
             }
             p23 = match p23.checked_mul(3) {
                 Some(v) => v,
@@ -1180,17 +1512,27 @@ pub fn next_smooth_size(n: usize) -> usize {
             None => break,
         };
     }
-    if best == usize::MAX { n } else { best }
+
+    match best {
+        Some((_, size)) => size,
+        // Nothing smooth inside the headroom: fall back to the next smooth length at any size.
+        None if smallest != usize::MAX => smallest,
+        None => n.next_power_of_two(),
+    }
 }
 
 /// Number of ADC-rate samples needed to fill both the ADC-rate spectra and the DDC output
-/// spectrum at `decimation`, including the decimation chain's settling time.
+/// spectrum at `decimation` and `detail`, including the decimation chain's settling time.
 ///
 /// Callers generating a wideband waveform must scale this by their oversampling ratio
 /// (simulation rate / Fs), otherwise the FFTs silently run short and lose resolution.
-pub fn required_tile_samples(decimation: u32) -> usize {
+///
+/// The decimator emits one sample per `decimation` inputs, so holding the output bin count fixed
+/// makes this term grow linearly with the decimation factor — that is the whole cost of
+/// [`SpectrumDetail`], and why [`MAX_WIDEBAND_SAMPLES`] exists to bound it.
+pub fn required_tile_samples(decimation: u32, detail: SpectrumDetail) -> usize {
     let f = decimation.max(1) as usize;
-    let for_output = output_fft_size(decimation) * f;
+    let for_output = detail.output_bins() * f;
     let settling = if f > 1 {
         decimation_chain(decimation).warmup_out_samples * f
     } else {
@@ -1503,7 +1845,7 @@ mod tests {
 
         let sim_fs = 10000.0;
         let input_samples = sig_gen.generate(1024, sim_fs);
-        let processed = process_adc_block(&input_samples, sim_fs, &block, &tile, Some(&input_samples), None, DEFAULT_DISPLAY_WINDOW);
+        let processed = process_adc_block(&input_samples, sim_fs, &block, &tile, Some(&input_samples), None, SpectrumAnalysis::default());
 
         // Find peak in output spectrum
         let peaks = crate::ui::spectrum_view::find_spectral_peaks(
@@ -1570,7 +1912,7 @@ mod tests {
 
         let sim_fs = 15000.0;
         let input_samples = sig_gen.generate(1024, sim_fs);
-        let processed = process_adc_block(&input_samples, sim_fs, &tile.blocks[0], &tile, None, None, DEFAULT_DISPLAY_WINDOW);
+        let processed = process_adc_block(&input_samples, sim_fs, &tile.blocks[0], &tile, None, None, SpectrumAnalysis::default());
 
         let peaks = crate::ui::spectrum_view::find_spectral_peaks(
             &processed.output_spectrum_dbfs,
@@ -1608,7 +1950,7 @@ mod tests {
 
         let sim_fs = 15000.0;
         let input = sig_gen.generate(16384, sim_fs);
-        let processed = process_adc_block(&input, sim_fs, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
+        let processed = process_adc_block(&input, sim_fs, &block, &tile, None, None, SpectrumAnalysis::default());
 
         let peaks = crate::ui::spectrum_view::find_spectral_peaks(
             &processed.output_spectrum_dbfs,
@@ -1664,7 +2006,7 @@ mod tests {
             sig_gen.noise_enabled = false;
 
             let input = sig_gen.generate(8192, 15000.0);
-            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
+            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None, SpectrumAnalysis::default());
 
             let peak_of = |s: &[f64]| s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let pre = peak_of(&processed.input_spectrum_dbfs);
@@ -1700,7 +2042,7 @@ mod tests {
             }];
             sig_gen.noise_enabled = false;
             let input = sig_gen.generate(8192, 15000.0);
-            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
+            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None, SpectrumAnalysis::default());
             processed
                 .folded_spectrum_dbfs
                 .iter()
@@ -1885,7 +2227,7 @@ mod tests {
             }];
             sig_gen.noise_enabled = false;
             let input = sig_gen.generate(16384, 15000.0);
-            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
+            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None, SpectrumAnalysis::default());
             let peaks = crate::ui::spectrum_view::find_spectral_peaks(
                 &processed.output_spectrum_dbfs,
                 &processed.output_freq_axis_mhz,
@@ -2076,12 +2418,12 @@ mod tests {
             })
             .collect();
 
-        let processed = process_adc_block(&samples, 15000.0, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
+        let processed = process_adc_block(&samples, 15000.0, &block, &tile, None, None, SpectrumAnalysis::default());
 
         // With DSA, the output peak should be ~6 dB lower than without DSA
         let mut block_no_dsa = block.clone();
         block_no_dsa.dsa_db = 0.0;
-        let processed_no_dsa = process_adc_block(&samples, 15000.0, &block_no_dsa, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
+        let processed_no_dsa = process_adc_block(&samples, 15000.0, &block_no_dsa, &tile, None, None, SpectrumAnalysis::default());
 
         let peak_with_dsa = processed.folded_spectrum_dbfs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let peak_no_dsa = processed_no_dsa.folded_spectrum_dbfs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -2265,6 +2607,296 @@ mod tests {
         );
     }
 
+    /// Build a capture the way `app.rs` does, and run it through the pipeline.
+    fn run_pipeline(
+        decim: crate::rfdc::DecimationFactor,
+        detail: SpectrumDetail,
+        tones: &[(f64, f64)],
+    ) -> ProcessedSignal {
+        use crate::rfdc::{AdcTile, MixerMode, MixerType};
+        use crate::signal::{SignalGenerator, Tone, ToneModulation};
+
+        let sim_fs = 15000.0;
+        let mut tile = AdcTile::new(0);
+        tile.sample_rate_gsps = 4.0;
+        {
+            let b = &mut tile.blocks[0];
+            b.decimation = decim;
+            b.mixer_settings.mixer_type = MixerType::Fine;
+            b.mixer_settings.mixer_mode = MixerMode::RealToIq;
+            b.mixer_settings.freq = -tones[0].0;
+        }
+        let block = tile.blocks[0].clone();
+
+        let oversampling = sim_fs / tile.sample_rate_mhz();
+        let num = next_smooth_size(
+            ((required_tile_samples(decim.factor(), detail) as f64 * oversampling).ceil() as usize)
+                .clamp(4096, MAX_WIDEBAND_SAMPLES),
+        );
+
+        let sig_gen = SignalGenerator {
+            tones: tones
+                .iter()
+                .map(|&(f, a)| Tone {
+                    frequency_mhz: f,
+                    amplitude_dbfs: a,
+                    phase_deg: 0.0,
+                    bandwidth_mhz: 0.0,
+                    modulation: ToneModulation::Cw,
+                })
+                .collect(),
+            noise_floor_dbfs: -110.0,
+            noise_enabled: false,
+        };
+        let samples = sig_gen.generate(num, sim_fs);
+        process_adc_block(
+            &samples,
+            sim_fs,
+            &block,
+            &tile,
+            None,
+            None,
+            SpectrumAnalysis { window: DEFAULT_DISPLAY_WINDOW, detail },
+        )
+    }
+
+    /// The bug this whole mechanism exists to fix: the old `ANALYSIS_FFT_SIZE / decimation`
+    /// policy made the bin count shrink at exactly the rate the span did, pinning the output
+    /// RBW at `Fs / 2048` for every factor. Decimating now buys resolution instead.
+    #[test]
+    fn output_resolution_improves_with_decimation() {
+        use crate::rfdc::DecimationFactor;
+
+        let detail = SpectrumDetail::Balanced;
+        let mut previous_rbw = f64::INFINITY;
+
+        for decim in DecimationFactor::ALL {
+            let out = run_pipeline(decim, detail, &[(300.0, -6.0)]);
+
+            // Balanced never outruns the sample budget, so the request is honoured exactly.
+            assert_eq!(
+                out.output_bins_analysed,
+                detail.output_bins(),
+                "×{} fell short of the requested bin count",
+                decim.factor()
+            );
+
+            let expected = out.output_sample_rate_mhz / detail.output_bins() as f64;
+            assert!(
+                (out.output_rbw_mhz - expected).abs() < expected * 1e-9,
+                "×{}: RBW {} MHz, expected {expected} MHz",
+                decim.factor(),
+                out.output_rbw_mhz
+            );
+
+            // Strictly finer at every step up, which the old policy never was.
+            assert!(
+                out.output_rbw_mhz < previous_rbw,
+                "×{}: RBW {} MHz did not improve on {previous_rbw} MHz",
+                decim.factor(),
+                out.output_rbw_mhz
+            );
+            previous_rbw = out.output_rbw_mhz;
+        }
+    }
+
+    /// The user-visible payoff: two tones far closer than the old 1.95 MHz resolution bandwidth
+    /// separate into distinct peaks, and drop back into one when the detail is turned down.
+    #[test]
+    fn detail_resolves_two_close_tones() {
+        use crate::rfdc::DecimationFactor;
+        use crate::ui::spectrum_view::find_spectral_peaks;
+
+        // 1.5 MHz apart at ×16, inside the 1.95 MHz the old policy resolved to. That is ~12
+        // Balanced bins — clear of the Blackman-Harris main lobe — but only ~3 Fast bins,
+        // which is inside it.
+        let tones = [(300.0, -6.0), (301.5, -9.0)];
+
+        let fine = run_pipeline(DecimationFactor::X16, SpectrumDetail::Balanced, &tones);
+        let fine_peaks = find_spectral_peaks(
+            &fine.output_spectrum_dbfs,
+            &fine.output_freq_axis_mhz,
+            -100.0,
+            fine.output_rbw_mhz,
+            fine.display_window,
+        );
+        assert!(
+            fine_peaks.len() >= 2,
+            "Balanced resolved {} peak(s) at RBW {} MHz; expected both tones",
+            fine_peaks.len(),
+            fine.output_rbw_mhz
+        );
+        let separation = (fine_peaks[0].freq_mhz - fine_peaks[1].freq_mhz).abs();
+        assert!(
+            (separation - 1.5).abs() < fine.output_rbw_mhz * 2.0,
+            "peaks {separation} MHz apart, expected ~1.5 MHz"
+        );
+
+        // Fast puts both tones inside one main lobe, so only one peak survives.
+        let coarse = run_pipeline(DecimationFactor::X16, SpectrumDetail::Fast, &tones);
+        let coarse_peaks = find_spectral_peaks(
+            &coarse.output_spectrum_dbfs,
+            &coarse.output_freq_axis_mhz,
+            -100.0,
+            coarse.output_rbw_mhz,
+            coarse.display_window,
+        );
+        assert_eq!(
+            coarse_peaks.len(),
+            1,
+            "Fast should merge tones 0.5 MHz apart at RBW {} MHz",
+            coarse.output_rbw_mhz
+        );
+    }
+
+    /// When the wideband budget cannot supply the requested record, the pane has to report the
+    /// resolution it actually achieved rather than the one it asked for.
+    #[test]
+    fn budget_clipping_is_reported_honestly() {
+        use crate::rfdc::DecimationFactor;
+
+        let detail = SpectrumDetail::Max;
+        let out = run_pipeline(DecimationFactor::X40, detail, &[(300.0, -6.0)]);
+
+        assert!(
+            out.output_bins_analysed < out.output_bins_requested,
+            "×40 at Max was expected to outrun the {MAX_WIDEBAND_SAMPLES}-sample budget"
+        );
+        assert_eq!(out.output_bins_requested, detail.output_bins());
+
+        // The reported RBW tracks what was transformed, not what was requested.
+        let expected = out.output_sample_rate_mhz / out.output_bins_analysed as f64;
+        assert!(
+            (out.output_rbw_mhz - expected).abs() < expected * 1e-9,
+            "RBW {} MHz does not match {} analysed bins",
+            out.output_rbw_mhz,
+            out.output_bins_analysed
+        );
+    }
+
+    /// The tabulated resampler kernel has to agree with evaluating the windowed sinc directly,
+    /// which is what it replaced — the tabulation is a speed change, not a modelling one.
+    #[test]
+    fn tabulated_resampler_matches_direct_evaluation() {
+        /// The original per-sample evaluation, kept here as the reference.
+        fn direct(w: &[Complex<f64>], sim: f64, tile: f64) -> Vec<Complex<f64>> {
+            let ratio = sim / tile;
+            let num = (w.len() as f64 / ratio).floor() as usize;
+            let radius = RESAMPLER_RADIUS;
+            let len = w.len() as isize;
+            (0..num)
+                .map(|n| {
+                    let pos = n as f64 * ratio;
+                    let centre = pos.floor() as isize;
+                    let (mut val, mut weight_sum) = (0.0, 0.0);
+                    for k in (centre - radius)..=(centre + radius) {
+                        if k < 0 || k >= len {
+                            continue;
+                        }
+                        let dx = pos - k as f64;
+                        let abs_dx = dx.abs();
+                        let norm_x = abs_dx / (radius as f64 + 1.0);
+                        if norm_x >= 1.0 {
+                            continue;
+                        }
+                        let sinc = if abs_dx < 1e-9 {
+                            1.0
+                        } else {
+                            (PI * dx).sin() / (PI * dx)
+                        };
+                        let window = 0.35875
+                            + 0.48829 * (PI * norm_x).cos()
+                            + 0.14128 * (2.0 * PI * norm_x).cos()
+                            + 0.01168 * (3.0 * PI * norm_x).cos();
+                        val += w[k as usize].re * sinc * window;
+                        weight_sum += sinc * window;
+                    }
+                    let v = if weight_sum.abs() > 1e-9 { val / weight_sum } else { 0.0 };
+                    Complex::new(v, 0.0)
+                })
+                .collect()
+        }
+
+        let sim_fs = 15000.0;
+        // 4000/2457.6/5000 divide the simulation rate into phases the table holds exactly;
+        // 3930 does not, and exercises the interpolation between neighbouring phases.
+        for tile_fs in [4000.0, 3930.0, 2457.6, 5000.0] {
+            let samples: Vec<Complex<f64>> = (0..4000)
+                .map(|i| {
+                    let t = i as f64 / sim_fs;
+                    let v = (2.0 * PI * 1234.5 * t).sin()
+                        + 0.3 * (2.0 * PI * 6789.0 * t).cos()
+                        + 0.05 * (2.0 * PI * 137.0 * t).sin();
+                    Complex::new(v, 0.0)
+                })
+                .collect();
+
+            let reference = direct(&samples, sim_fs, tile_fs);
+            let tabulated = sample_adc_at_tile_rate(&samples, sim_fs, tile_fs);
+            assert_eq!(reference.len(), tabulated.len());
+
+            let worst = reference
+                .iter()
+                .zip(&tabulated)
+                .map(|(a, b)| (a.re - b.re).abs())
+                .fold(0.0_f64, f64::max);
+            let rms = (reference.iter().map(|s| s.re * s.re).sum::<f64>()
+                / reference.len() as f64)
+                .sqrt();
+
+            // Comfortably under the kernel's own ~100 dB spur floor, so the tabulation is
+            // never what limits the resampler.
+            let error_dbc = 20.0 * (worst / rms).log10();
+            assert!(
+                error_dbc < -140.0,
+                "Fs={tile_fs}: tabulation differs by {error_dbc:.1} dBc"
+            );
+        }
+    }
+
+    #[test]
+    fn smooth_size_is_smooth_and_never_shrinks() {
+        for n in [1usize, 2, 3, 100, 4095, 4096, 4097, 100_000, 124_000, 125_001] {
+            let size = next_smooth_size(n);
+            assert!(size >= n, "next_smooth_size({n}) = {size} is smaller than its input");
+            assert!(
+                smooth_size_cost(size).is_some(),
+                "next_smooth_size({n}) = {size} is not 5-smooth"
+            );
+        }
+
+        // The wideband ceiling is itself a power of two, so sizing up from the clamped target
+        // lands exactly on it rather than overshooting the budget.
+        assert_eq!(
+            next_smooth_size(MAX_WIDEBAND_SAMPLES),
+            MAX_WIDEBAND_SAMPLES,
+            "sizing overshot the wideband sample budget"
+        );
+    }
+
+    /// The point of the cost model: the smallest smooth length above the target is often heavy
+    /// in radix 5, and a slightly larger power of two beats it outright.
+    #[test]
+    fn smooth_size_avoids_radix_five_heavy_lengths() {
+        // 125000 = 2^3·5^6 is the smallest 5-smooth length above 124 000, and is measurably
+        // slower to transform than 124416 = 2^9·3^5 despite being larger.
+        let size = next_smooth_size(124_000);
+        assert_ne!(size, 125_000, "picked the radix-5-heavy length");
+        assert!(smooth_size_cost(size).unwrap() < smooth_size_cost(125_000).unwrap());
+    }
+
+    /// The ADC-rate panes ride along on whatever record the DDC output needed.
+    #[test]
+    fn analysis_fft_grows_with_the_available_record() {
+        assert_eq!(analysis_fft_size(0), ANALYSIS_FFT_SIZE);
+        assert_eq!(analysis_fft_size(ANALYSIS_FFT_SIZE - 1), ANALYSIS_FFT_SIZE);
+        assert_eq!(analysis_fft_size(ANALYSIS_FFT_SIZE), ANALYSIS_FFT_SIZE);
+        // Rounds down to a power of two rather than up past what is available.
+        assert_eq!(analysis_fft_size(ANALYSIS_FFT_SIZE * 2 - 1), ANALYSIS_FFT_SIZE);
+        assert_eq!(analysis_fft_size(ANALYSIS_FFT_SIZE * 2), ANALYSIS_FFT_SIZE * 2);
+        assert_eq!(analysis_fft_size(usize::MAX), ANALYSIS_FFT_MAX);
+    }
+
     /// Every spectrum handed to the UI should arrive with enough points to draw, whatever the
     /// decimation does to the native transform length.
     #[test]
@@ -2286,9 +2918,10 @@ mod tests {
             let block = tile.blocks[0].clone();
 
             let oversampling = sim_fs / tile.sample_rate_mhz();
-            let needed = required_tile_samples(decim.factor());
+            let needed = required_tile_samples(decim.factor(), SpectrumDetail::default());
             let num = next_smooth_size(
-                ((needed as f64 * oversampling).ceil() as usize).clamp(4096, 131_072),
+                ((needed as f64 * oversampling).ceil() as usize)
+                    .clamp(4096, MAX_WIDEBAND_SAMPLES),
             );
 
             let sig_gen = SignalGenerator {
@@ -2303,7 +2936,7 @@ mod tests {
                 noise_enabled: true,
             };
             let samples = sig_gen.generate(num, sim_fs);
-            let out = process_adc_block(&samples, sim_fs, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
+            let out = process_adc_block(&samples, sim_fs, &block, &tile, None, None, SpectrumAnalysis::default());
 
             // One-sided spectra land on DISPLAY_FFT_SIZE/2 + 1 points, two-sided on the full count.
             let floor = DISPLAY_FFT_SIZE / 2;
@@ -2380,7 +3013,9 @@ mod tests {
         let block = tile.blocks[0].clone();
         let oversampling = sim_fs / tile.sample_rate_mhz();
         let num = next_smooth_size(
-            ((required_tile_samples(8) as f64 * oversampling).ceil() as usize).clamp(4096, 131_072),
+            ((required_tile_samples(8, SpectrumDetail::default()) as f64 * oversampling).ceil()
+                as usize)
+                .clamp(4096, MAX_WIDEBAND_SAMPLES),
         );
         let sig_gen = SignalGenerator {
             tones: vec![Tone {
@@ -2397,7 +3032,15 @@ mod tests {
 
         // Worst leakage well outside either window's main lobe.
         let skirt_db = |w: FftWindow| {
-            let out = process_adc_block(&samples, sim_fs, &block, &tile, None, None, w);
+            let out = process_adc_block(
+                &samples,
+                sim_fs,
+                &block,
+                &tile,
+                None,
+                None,
+                SpectrumAnalysis { window: w, ..Default::default() },
+            );
             let spec = &out.output_spectrum_dbfs;
             let freq = &out.output_freq_axis_mhz;
             let peak = spec.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -2425,4 +3068,14 @@ mod tests {
         );
     }
 }
+
+
+
+
+
+
+
+
+
+
 

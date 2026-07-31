@@ -245,6 +245,13 @@ pub struct NodeStats {
 /// Evaluation result: the waveform handed to the converter plus the chain's RF budget.
 pub struct GraphEvaluationResult {
     pub samples: Vec<Complex<f64>>,
+    /// The chain's source output, before any RF stage acted on it.
+    ///
+    /// Drawn as the reference trace on the input spectrum. It comes back from the same
+    /// evaluation that produced `samples` rather than being generated again — at wideband
+    /// lengths that second pass cost as much as the rest of the chain — and it is the source
+    /// the graph actually contains, which the separately generated one was not.
+    pub source_samples: Vec<Complex<f64>>,
     pub rf_chain_response_db: Vec<f64>,
     pub rf_chain_freq_axis_mhz: Vec<f64>,
     pub cascaded_gain_db: f64,
@@ -288,11 +295,22 @@ fn upstream(snarl: &Snarl<RfNode>, node: NodeId, port: usize) -> Option<OutPinId
         .copied()
 }
 
+/// State the recursive walk threads through itself: where it is, and what it has picked up.
+#[derive(Default)]
+struct EvalTrace {
+    /// Nodes currently being expanded, so a feedback loop is detected rather than recursed
+    /// into forever.
+    path: Vec<NodeId>,
+    /// Nodes found to be wired in a cycle. They are reported and evaluate to nothing, which is
+    /// the only sensible answer for a forward-only chain model.
+    cycles: Vec<NodeId>,
+    /// Signal level reached at each node, for the graph annotations.
+    levels: Vec<(NodeId, f64)>,
+    /// Output of the first source reached, for the pre-RF-chain reference trace.
+    source_samples: Option<Vec<Complex<f64>>>,
+}
+
 /// Walk the graph backwards from `node`, gathering the waveform arriving at its input.
-///
-/// `path` carries the nodes currently being expanded so a feedback loop is detected rather
-/// than recursed into forever; anything wired in a cycle is reported and evaluates to
-/// nothing, which is the only sensible answer for a forward-only chain model.
 fn evaluate_samples(
     snarl: &Snarl<RfNode>,
     node_id: NodeId,
@@ -300,13 +318,11 @@ fn evaluate_samples(
     num_samples: usize,
     ctx: &ChainCtx,
     global_signal_gen: &SignalGenerator,
-    path: &mut Vec<NodeId>,
-    cycles: &mut Vec<NodeId>,
-    levels: &mut Vec<(NodeId, f64)>,
+    trace: &mut EvalTrace,
 ) -> Option<Vec<Complex<f64>>> {
-    if path.contains(&node_id) {
-        if !cycles.contains(&node_id) {
-            cycles.push(node_id);
+    if trace.path.contains(&node_id) {
+        if !trace.cycles.contains(&node_id) {
+            trace.cycles.push(node_id);
         }
         return None;
     }
@@ -336,11 +352,18 @@ fn evaluate_samples(
         let mut out: Vec<Complex<f64>> = raw.iter().map(|s| Complex::new(s.re, 0.0)).collect();
         // A matched source delivers kTB on top of whatever it is generating.
         add_source_noise(&mut out, &ctx.for_node(node_seed(node_id)));
-        record_level(levels, node_id, &out);
+        record_level(&mut trace.levels, node_id, &out);
+        // Hand the first source's output back up so the spectrum view can draw it as the
+        // pre-RF-chain reference without generating the same waveform a second time. First
+        // rather than last: with several sources feeding a combiner, the one reached first
+        // walking back from the ADC is the one the chain is built around.
+        if trace.source_samples.is_none() {
+            trace.source_samples = Some(out.clone());
+        }
         return Some(out);
     }
 
-    path.push(node_id);
+    trace.path.push(node_id);
 
     let mut input_signals = Vec::new();
     for input_idx in 0..node.num_inputs() {
@@ -352,16 +375,14 @@ fn evaluate_samples(
                 num_samples,
                 ctx,
                 global_signal_gen,
-                path,
-                cycles,
-                levels,
+                trace,
             ) {
                 input_signals.push(samples);
             }
         }
     }
 
-    path.pop();
+    trace.path.pop();
 
     if input_signals.is_empty() {
         return None;
@@ -381,7 +402,7 @@ fn evaluate_samples(
         Some(c) => c.process(&combined, &ctx.for_node(node_seed(node_id)), out_port),
         None => combined,
     };
-    record_level(levels, node_id, &out);
+    record_level(&mut trace.levels, node_id, &out);
     Some(out)
 }
 
@@ -459,7 +480,7 @@ pub fn evaluate_graph(
     }
     let adc_node_id = target_adc_id?;
 
-    let (chain, mut cycle_nodes) = chain_order(snarl, adc_node_id);
+    let (chain, cycle_nodes) = chain_order(snarl, adc_node_id);
     if chain.is_empty() {
         return None;
     }
@@ -485,8 +506,9 @@ pub fn evaluate_graph(
         env.thermal_noise.then_some(env.temperature_k),
     );
 
-    let mut path = Vec::new();
-    let mut levels: Vec<(NodeId, f64)> = Vec::new();
+    // Cycles already found while ordering the chain carry into the walk, so both sources of
+    // them end up in one list.
+    let mut trace = EvalTrace { cycles: cycle_nodes, ..Default::default() };
     let padded = evaluate_samples(
         snarl,
         adc_node_id,
@@ -494,11 +516,15 @@ pub fn evaluate_graph(
         num_samples + guard,
         &ctx,
         global_signal_gen,
-        &mut path,
-        &mut cycle_nodes,
-        &mut levels,
+        &mut trace,
     )?;
+    let EvalTrace { cycles: cycle_nodes, levels, source_samples: padded_source, .. } = trace;
+
     let samples: Vec<Complex<f64>> = padded.into_iter().skip(guard).collect();
+    // The run-up is discarded from the source the same way, so the two stay sample-aligned.
+    let source_samples: Vec<Complex<f64>> = padded_source
+        .map(|s| s.into_iter().skip(guard).collect())
+        .unwrap_or_default();
 
     // Cumulative frequency response across the simulated band, for the spectrum overlay.
     let num_resp_bins = 256;
@@ -615,6 +641,7 @@ pub fn evaluate_graph(
 
     Some(GraphEvaluationResult {
         samples,
+        source_samples,
         rf_chain_response_db,
         rf_chain_freq_axis_mhz,
         cascaded_gain_db,
@@ -1104,6 +1131,63 @@ mod tests {
         let res = evaluate_graph(&snarl, 0, 0, 4096, 15000.0, &hot, 0.0, &quiet_env()).unwrap();
         assert!(res.compressing, "an overdriven amp should raise the flag");
         assert!(res.node_stats[1].1.compression_db < -1.0);
+    }
+
+    /// The source trace comes back from the evaluation instead of being generated a second
+    /// time, so it has to be the real thing: sample-aligned with the chain output, the same
+    /// length, and carrying the source the graph actually contains.
+    #[test]
+    fn source_samples_are_the_graphs_own_unfiltered_source() {
+        // A low-pass far below the tone, so the chain output is nothing like its source.
+        let mut f = FilterNode::default();
+        f.model.filter_type = FilterType::LowPass;
+        f.model.cutoff_mhz = 100.0;
+        f.model.order = 4;
+        f.model.insertion_loss_db = 0.0;
+        let (snarl, _) = build_chain(vec![RfNode::Filter(f)]);
+
+        let g = SignalGenerator {
+            tones: vec![crate::signal::Tone {
+                frequency_mhz: 1000.0,
+                amplitude_dbfs: 0.0,
+                phase_deg: 0.0,
+                bandwidth_mhz: 0.0,
+                modulation: crate::signal::ToneModulation::Cw,
+            }],
+            noise_floor_dbfs: -200.0,
+            noise_enabled: false,
+        };
+
+        let res = evaluate_graph(&snarl, 0, 0, 4096, 15000.0, &g, 3.0, &quiet_env()).unwrap();
+
+        assert_eq!(
+            res.source_samples.len(),
+            res.samples.len(),
+            "source and chain output must stay sample-aligned"
+        );
+
+        // The source carries the tone at full amplitude; the filtered output does not.
+        let source_peak = res.source_samples.iter().map(|s| s.re.abs()).fold(0.0, f64::max);
+        let out_peak = res.samples.iter().map(|s| s.re.abs()).fold(0.0, f64::max);
+        assert!(
+            source_peak > 0.9,
+            "source should carry the unfiltered 0 dBFS tone, peaked at {source_peak}"
+        );
+        assert!(
+            out_peak < source_peak * 0.5,
+            "the low-pass should have removed the tone: source {source_peak}, output {out_peak}"
+        );
+
+        // It must match what generating the source directly would have produced, which is the
+        // waveform this replaced. Source noise is off here, so the two agree exactly.
+        let direct = g.generate_at_time(4096, 15000.0, 3.0);
+        let worst = res
+            .source_samples
+            .iter()
+            .zip(&direct)
+            .map(|(a, b)| (a.re - b.re).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(worst < 1e-9, "source trace differs from the generator by {worst}");
     }
 
     #[test]

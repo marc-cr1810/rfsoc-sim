@@ -1,8 +1,8 @@
 //! Spectrum visualization plots using egui_plot and waterfall spectrogram.
 
-use crate::dsp::{FftWindow, ProcessedSignal};
+use crate::dsp::{FftWindow, ProcessedSignal, SpectrumDetail};
 use crate::ui::theme::Theme;
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
@@ -14,14 +14,41 @@ use std::collections::VecDeque;
 /// keeps their plot areas identical. Wide enough for "-150" plus padding.
 const PLOT_Y_AXIS_WIDTH: f32 = 56.0;
 
-/// Widest waterfall texture built per frame. Beyond this the extra columns land inside a
-/// pixel anyway, and the upload cost is paid every frame.
-const WATERFALL_MAX_COLUMNS: usize = 1024;
+/// Widest waterfall texture built. The texture covers only the visible frequency range, so
+/// columns track screen pixels; this is the ceiling for a very wide window on a HiDPI display.
+const WATERFALL_MAX_COLUMNS: usize = 4096;
+
+/// Narrowest waterfall texture, so a hard zoom onto a handful of bins still uploads something
+/// the interpolator can work with.
+const WATERFALL_MIN_COLUMNS: usize = 64;
 
 struct WaterfallState {
     paused: bool,
     min_db: f64,
     max_db: f64,
+    /// Rows of history kept. User-adjustable: deep history shows slow drift, shallow history
+    /// gives each row more vertical pixels.
+    depth: usize,
+    /// `ProcessedSignal::sequence` of the newest row, so a repainted frame does not push a
+    /// duplicate. The pipeline runs slower than the frame rate at high detail.
+    last_sequence: u64,
+    /// Cached texture and the inputs it was built from. Rebuilding is proportional to
+    /// columns × rows, which is why it only happens when one of those inputs moves.
+    texture: Option<egui::TextureHandle>,
+    texture_key: Option<WaterfallKey>,
+}
+
+/// Everything the waterfall texture's pixels depend on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WaterfallKey {
+    sequence: u64,
+    rows: usize,
+    columns: usize,
+    /// Visible frequency range, in bits so the key can derive `PartialEq` and `Copy`.
+    x_min_bits: u64,
+    x_max_bits: u64,
+    min_db_bits: u64,
+    max_db_bits: u64,
 }
 
 impl Default for WaterfallState {
@@ -30,6 +57,10 @@ impl Default for WaterfallState {
             paused: false,
             min_db: -140.0,
             max_db: 0.0,
+            depth: 256,
+            last_sequence: 0,
+            texture: None,
+            texture_key: None,
         }
     }
 }
@@ -37,6 +68,49 @@ impl Default for WaterfallState {
 thread_local! {
     static WATERFALL_BUFFER: RefCell<VecDeque<Vec<f64>>> = RefCell::new(VecDeque::new());
     static WATERFALL_STATE: RefCell<WaterfallState> = RefCell::new(WaterfallState::default());
+}
+
+/// Magma-style ramp for a 0..1 intensity: black → blue → purple → red → yellow.
+fn magma(norm: f64) -> egui::Color32 {
+    let r = (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+    let g = (norm * 3.0 - 2.0).clamp(0.0, 1.0);
+    let b = (norm * 3.0).clamp(0.0, 1.0) - (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+    egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+/// Full frequency range of an output spectrum: `±Fout/2` for complex I/Q, `0..Fout/2` for real.
+///
+/// A real-output block's spectrum comes back one-sided, so assuming a two-sided axis would
+/// stretch it across twice its true span and mislabel every frequency on it.
+fn output_span_mhz(output_rate_mhz: f64, complex_output: bool) -> (f64, f64) {
+    if complex_output {
+        (-output_rate_mhz / 2.0, output_rate_mhz / 2.0)
+    } else {
+        (0.0, output_rate_mhz / 2.0)
+    }
+}
+
+/// Half-open bin range of `len` covering `[view_min, view_max]` within the axis `[full_min, full_max]`.
+///
+/// The frequency axis is uniform, so this is a straight linear map. Clamped to the axis and
+/// widened to at least one bin, so a view entirely outside the span still yields something
+/// drawable rather than an empty slice.
+fn visible_bin_range(
+    len: usize,
+    full_min: f64,
+    full_max: f64,
+    view_min: f64,
+    view_max: f64,
+) -> (usize, usize) {
+    let span = full_max - full_min;
+    if len == 0 || span <= 0.0 {
+        return (0, len);
+    }
+    let to_bin = |x: f64| (((x - full_min) / span) * len as f64).floor();
+    let lo = (to_bin(view_min).max(0.0) as usize).min(len.saturating_sub(1));
+    // Ceil the high edge so a partially covered bin is still included.
+    let hi = ((to_bin(view_max).max(0.0) as usize) + 1).clamp(lo + 1, len);
+    (lo, hi)
 }
 
 /// A detected spectral peak.
@@ -116,13 +190,14 @@ pub fn find_spectral_peaks(
 }
 
 /// Render the multi-pane spectrum display with waterfall and peak markers.
-/// Renders the spectrum panes. Returns true if the user changed the analysis window, so the
-/// caller can recompute even with auto-compute off.
+/// Renders the spectrum panes. Returns true if the user changed the analysis settings, so the
+/// caller can recompute against them immediately instead of waiting out its pacing interval.
 pub fn show_spectrum_view(
     ui: &mut egui::Ui,
     processed: &Option<ProcessedSignal>,
     tile_fs_mhz: f64,
     display_window: &mut FftWindow,
+    detail: &mut SpectrumDetail,
 ) -> bool {
     let mut window_changed = false;
     if let Some(signal) = processed {
@@ -159,6 +234,58 @@ pub fn show_spectrum_view(
                     );
                 ui.label(egui::RichText::new("FFT window:").color(Theme::TEXT_SECONDARY));
                 window_changed = *display_window != before;
+            });
+        });
+
+        // Resolution sits on its own row beside the bandwidth it produces: the two only mean
+        // anything together, and the heading row is already crowded at narrow widths.
+        ui.horizontal(|ui| {
+            ui.colored_label(
+                Theme::TEXT_SECONDARY,
+                format!(
+                    "Post-DDC RBW: {} over {} bins",
+                    format_rbw(signal.output_rbw_mhz),
+                    signal.output_bins_analysed
+                ),
+            );
+            // The record is capped, so a high detail setting at a high decimation factor can ask
+            // for more bins than the capture can fill. Say so rather than quietly under-deliver.
+            if signal.output_bins_analysed < signal.output_bins_requested {
+                ui.colored_label(
+                    Theme::ACCENT_WARN,
+                    format!(
+                        "⚠ sample-budget limited (requested {})",
+                        signal.output_bins_requested
+                    ),
+                )
+                .on_hover_text(
+                    "This decimation factor would need a longer capture than the wideband \
+                     sample budget allows. Lower the resolution or the decimation factor to \
+                     get the requested bin count.",
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let before_detail = *detail;
+                egui::ComboBox::from_id_salt("spectrum_detail")
+                    .selected_text(detail.to_string())
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for d in SpectrumDetail::ALL {
+                            ui.selectable_value(detail, d, d.to_string())
+                                .on_hover_text(detail_hint(d, signal.output_sample_rate_mhz));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Bins the post-DDC transform resolves, held constant across decimation \
+                         factors — so decimating narrows the resolution bandwidth instead of \
+                         leaving it fixed. Each step up needs proportionally more wideband \
+                         signal generated per capture, and the spectrum update rate drops to \
+                         pay for it.",
+                    );
+                ui.label(egui::RichText::new("Resolution:").color(Theme::TEXT_SECONDARY));
+                window_changed |= *detail != before_detail;
             });
         });
         ui.separator();
@@ -282,7 +409,7 @@ pub fn show_spectrum_view(
         let link_group = ui.id().with("baseband_x_link");
 
         // 4. Post-DDC Spectrum — what the PL receives
-        show_single_spectrum(
+        let output_bounds = show_single_spectrum(
             ui,
             SpectrumPlot {
                 id: "output_spectrum",
@@ -426,11 +553,16 @@ pub fn show_spectrum_view(
                     }
                 }
 
-                if new_len > 0 && !state.paused {
-                    if history.len() >= 256 {
-                        history.pop_back();
-                    }
+                // One row per capture, not per frame. The pipeline is paced independently of
+                // the repaint rate, so keying off the sequence number is what stops a slow
+                // capture from being smeared across a run of identical rows.
+                let fresh = signal.sequence != state.last_sequence;
+                if new_len > 0 && fresh && !state.paused {
                     history.push_front(signal.output_spectrum_dbfs.clone());
+                }
+                state.last_sequence = signal.sequence;
+                while history.len() > state.depth {
+                    history.pop_back();
                 }
 
                 // Deliberately not wrapped in ui.group: the group inset would shift this
@@ -452,27 +584,31 @@ pub fn show_spectrum_view(
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("🗑 Clear").clicked() {
                             history.clear();
+                            // Let the current capture repopulate the first row immediately
+                            // rather than leaving the pane blank until the next one lands.
+                            state.last_sequence = 0;
                         }
                         if ui.button(if state.paused { "▶ Resume" } else { "⏸ Freeze" }).clicked() {
                             state.paused = !state.paused;
                         }
                         
+                        ui.add(
+                            egui::Slider::new(&mut state.depth, 32..=1024)
+                                .text("History")
+                                .logarithmic(true),
+                        )
+                        .on_hover_text(
+                            "Captures kept. Deeper history reaches further back; shallower \
+                             gives each capture more vertical pixels.",
+                        );
                         ui.add(egui::Slider::new(&mut state.max_db, -150.0..=20.0).text("Max dB"));
                         ui.add(egui::Slider::new(&mut state.min_db, -150.0..=20.0).text("Min dB"));
-                        
+
                         // Colorbar Legend
                         let mut legend_pixels = Vec::with_capacity(60 * 10);
                         for _y in 0..10 {
                             for x in 0..60 {
-                                let norm = x as f64 / 59.0;
-                                let r = (norm * 3.0 - 1.0).clamp(0.0, 1.0);
-                                let g = (norm * 3.0 - 2.0).clamp(0.0, 1.0);
-                                let b = (norm * 3.0).clamp(0.0, 1.0) - (norm * 3.0 - 1.0).clamp(0.0, 1.0);
-                                legend_pixels.push(egui::Color32::from_rgb(
-                                    (r * 255.0) as u8,
-                                    (g * 255.0) as u8,
-                                    (b * 255.0) as u8,
-                                ));
+                                legend_pixels.push(magma(x as f64 / 59.0));
                             }
                         }
                         let legend_img = egui::ColorImage::new([60, 10], legend_pixels);
@@ -482,51 +618,89 @@ pub fn show_spectrum_view(
                     });
                 });
 
-                // The texture is rebuilt and re-uploaded every frame, so its width is
-                // capped independently of the spectrum length. Columns fold together by
-                // max-hold rather than picking one bin, so a tone narrower than a column
-                // still paints it instead of flickering in and out between frames.
-                let width = new_len.min(WATERFALL_MAX_COLUMNS);
-                let height = history.len();
-                if width > 0 && height > 0 {
-                    let mut pixels = Vec::with_capacity(width * height);
-                    let range_db = (state.max_db - state.min_db).max(0.1);
+                // A real-output block hands back a one-sided 0..Fout/2 spectrum; assuming
+                // ±Fout/2 would stretch it across twice its span and mislabel every frequency.
+                let (full_min, full_max) =
+                    output_span_mhz(signal.output_sample_rate_mhz, signal.complex_output);
 
-                    for row in history.iter() {
-                        if row.len() == new_len {
+                // Render only what is on screen. The x axis is linked to the pane above, so
+                // these are its bounds: zooming in then buys the waterfall real detail instead
+                // of magnifying columns it folded away at full span.
+                let view_min = output_bounds.min()[0].max(full_min);
+                let view_max = output_bounds.max()[0].min(full_max);
+                let (bin_lo, bin_hi) = if view_max > view_min {
+                    visible_bin_range(new_len, full_min, full_max, view_min, view_max)
+                } else {
+                    (0, new_len)
+                };
+                // Frequencies the texture's edges actually land on, so the image is placed on
+                // the bin boundaries it was built from rather than on the requested view.
+                let bin_width = (full_max - full_min) / new_len.max(1) as f64;
+                let tex_min = full_min + bin_lo as f64 * bin_width;
+                let tex_max = full_min + bin_hi as f64 * bin_width;
+
+                // One column per screen pixel: past that the extra columns land inside a pixel,
+                // short of it the plot upscales a texture coarser than the display.
+                let visible_bins = bin_hi - bin_lo;
+                let pixel_width = (ui.available_width() - PLOT_Y_AXIS_WIDTH).max(0.0) as usize;
+                let width = pixel_width
+                    .min(visible_bins)
+                    .clamp(WATERFALL_MIN_COLUMNS.min(visible_bins.max(1)), WATERFALL_MAX_COLUMNS);
+                let height = history.len();
+
+                if width > 0 && height > 0 {
+                    let key = WaterfallKey {
+                        sequence: state.last_sequence,
+                        rows: height,
+                        columns: width,
+                        x_min_bits: tex_min.to_bits(),
+                        x_max_bits: tex_max.to_bits(),
+                        min_db_bits: state.min_db.to_bits(),
+                        max_db_bits: state.max_db.to_bits(),
+                    };
+
+                    // Rebuilding costs columns × rows and uploads the lot, so it happens only
+                    // when one of the inputs it depends on has actually moved.
+                    if state.texture_key != Some(key) || state.texture.is_none() {
+                        let mut pixels = Vec::with_capacity(width * height);
+                        let range_db = (state.max_db - state.min_db).max(0.1);
+
+                        for row in history.iter() {
+                            if row.len() != new_len {
+                                continue;
+                            }
                             for col in 0..width {
-                                let lo = col * new_len / width;
-                                let hi = (((col + 1) * new_len / width).max(lo + 1)).min(new_len);
+                                // Columns fold together by max-hold rather than picking one
+                                // bin, so a tone narrower than a column still paints it
+                                // instead of flickering in and out between captures. Zoomed
+                                // in far enough that bins outnumber columns no longer holds,
+                                // and the texture filter interpolates instead.
+                                let lo = bin_lo + col * visible_bins / width;
+                                let hi = (bin_lo + (col + 1) * visible_bins / width)
+                                    .max(lo + 1)
+                                    .min(bin_hi);
                                 let mag = row[lo..hi]
                                     .iter()
                                     .copied()
                                     .fold(f64::NEG_INFINITY, f64::max);
 
-                                // Map dBFS using dynamic range
                                 let norm = ((mag - state.min_db) / range_db).clamp(0.0, 1.0);
-
-                                // Magma/Inferno style colormap: Black -> Blue -> Purple -> Red -> Yellow
-                                let r = (norm * 3.0 - 1.0).clamp(0.0, 1.0);
-                                let g = (norm * 3.0 - 2.0).clamp(0.0, 1.0);
-                                let b = (norm * 3.0).clamp(0.0, 1.0) - (norm * 3.0 - 1.0).clamp(0.0, 1.0);
-
-                                pixels.push(egui::Color32::from_rgb(
-                                    (r * 255.0) as u8,
-                                    (g * 255.0) as u8,
-                                    (b * 255.0) as u8,
-                                ));
+                                pixels.push(magma(norm));
                             }
+                        }
+
+                        if pixels.len() == width * height {
+                            let img = egui::ColorImage::new([width, height], pixels);
+                            state.texture = Some(ui.ctx().load_texture(
+                                "waterfall_texture",
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                            state.texture_key = Some(key);
                         }
                     }
 
-                    if pixels.len() == width * height {
-                        let img = egui::ColorImage::new([width, height], pixels);
-                        let texture = ui.ctx().load_texture(
-                            "waterfall_texture",
-                            img,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        
+                    if let Some(texture) = state.texture.clone() {
                         // The y axis is shown, and both plots pin the same width, so the
                         // waterfall's columns stay under the matching spectrum bins.
                         // Newest row is at the top, so the label counts back from there.
@@ -537,7 +711,7 @@ pub fn show_spectrum_view(
                             .link_axis(link_group, [true, false])
                             .show_axes([true, true])
                             .x_axis_label("Baseband Offset Frequency (MHz)")
-                            .y_axis_label("Frames Ago")
+                            .y_axis_label("Captures Ago")
                             .y_axis_min_width(PLOT_Y_AXIS_WIDTH)
                             .y_axis_formatter(move |mark, _| {
                                 let ago = height as f64 - mark.value;
@@ -548,19 +722,19 @@ pub fn show_spectrum_view(
                                 }
                             })
                             .show_grid(false);
-                        
+
                         let inner = plot.show(ui, |plot_ui| {
-                            let x_min = -signal.output_sample_rate_mhz / 2.0;
-                            let x_max = signal.output_sample_rate_mhz / 2.0;
-                            
                             let image = egui_plot::PlotImage::new(
                                 "waterfall_img",
                                 texture.id(),
-                                egui_plot::PlotPoint::new((x_max + x_min) / 2.0, height as f64 / 2.0),
-                                [(x_max - x_min) as f32, height as f32],
+                                egui_plot::PlotPoint::new(
+                                    (tex_max + tex_min) / 2.0,
+                                    height as f64 / 2.0,
+                                ),
+                                [(tex_max - tex_min) as f32, height as f32],
                             );
                             plot_ui.image(image);
-                            
+
                             plot_ui.pointer_coordinate()
                         });
 
@@ -572,22 +746,27 @@ pub fn show_spectrum_view(
                                     .round()
                                     .clamp(0.0, height.saturating_sub(1) as f64)
                                     as usize;
-                                
-                                let x_min = -signal.output_sample_rate_mhz / 2.0;
-                                let x_max = signal.output_sample_rate_mhz / 2.0;
-                                let freq_span = x_max - x_min;
-                                let x_norm = ((coord.x - x_min) / freq_span).clamp(0.0, 1.0);
-                                // Index the spectrum, not the (possibly narrower) texture.
-                                let bin_idx = (x_norm * (new_len as f64 - 1.0)).round() as usize;
 
-                                let mag = history.get(frame_idx)
+                                // Index the spectrum, not the texture: the texture folded
+                                // bins together, and the readout should quote the real bin
+                                // under the cursor.
+                                let span = full_max - full_min;
+                                let x_norm = ((coord.x - full_min) / span).clamp(0.0, 1.0);
+                                let bin_idx = ((x_norm * (new_len as f64 - 1.0)).round() as usize)
+                                    .min(new_len.saturating_sub(1));
+
+                                let mag = history
+                                    .get(frame_idx)
                                     .and_then(|row| row.get(bin_idx))
                                     .copied()
                                     .unwrap_or(-150.0);
 
-                                ui.label(egui::RichText::new(format!("Freq: {:.3} MHz", coord.x)).strong());
-                                ui.label(format!("Time: {} frames ago", frame_idx));
-                                ui.label(format!("Magnitude: {:.1} dBFS", mag));
+                                ui.label(
+                                    egui::RichText::new(format!("Freq: {:.3} MHz", coord.x))
+                                        .strong(),
+                                );
+                                ui.label(format!("Time: {frame_idx} captures ago"));
+                                ui.label(format!("Magnitude: {mag:.1} dBFS"));
                             });
                         }
                     }
@@ -611,6 +790,36 @@ fn window_hint(window: FftWindow) -> &'static str {
         FftWindow::BlackmanHarris => "Sidelobes -92 dB: a tone shows one clean lobe. ~36% wider than Hanning at -3 dB.",
         FftWindow::FlatTop => "Amplitude accuracy: reads a tone's true level however it falls between bins. Widest lobe.",
         FftWindow::Rectangular => "No window. Sharpest lobe, worst leakage — only for coherently sampled tones.",
+    }
+}
+
+/// Hover text for a detail level, quoting the resolution bandwidth it buys at the current span.
+fn detail_hint(detail: SpectrumDetail, output_rate_mhz: f64) -> String {
+    let rbw = if detail.output_bins() > 0 {
+        output_rate_mhz / detail.output_bins() as f64
+    } else {
+        0.0
+    };
+    let cost = match detail {
+        SpectrumDetail::Fast => "Cheapest capture; use when sweeping settings.",
+        SpectrumDetail::Balanced => "Default. Comfortable on most configurations.",
+        SpectrumDetail::Fine => "4× the capture length; the update rate starts to drop.",
+        SpectrumDetail::Max => {
+            "16× the capture length. Expect a visibly slow update rate, and the sample budget \
+             may cap it at high decimation."
+        }
+    };
+    format!("{} bins → RBW {} here. {cost}", detail.output_bins(), format_rbw(rbw))
+}
+
+/// Resolution bandwidth in whichever unit keeps it readable.
+fn format_rbw(rbw_mhz: f64) -> String {
+    if rbw_mhz >= 1.0 {
+        format!("{rbw_mhz:.2} MHz")
+    } else if rbw_mhz >= 0.001 {
+        format!("{:.1} kHz", rbw_mhz * 1000.0)
+    } else {
+        format!("{:.1} Hz", rbw_mhz * 1e6)
     }
 }
 
@@ -685,7 +894,12 @@ impl Default for SpectrumPlot<'_> {
     }
 }
 
-fn show_single_spectrum(ui: &mut egui::Ui, p: SpectrumPlot<'_>) {
+/// Draws one spectrum pane and returns the plot bounds it settled on.
+///
+/// The waterfall is drawn straight after the post-DDC pane and shares its linked x axis, so
+/// those bounds are exactly the range it needs to render — read this frame, not lagged a frame
+/// behind as reading its own bounds would be.
+fn show_single_spectrum(ui: &mut egui::Ui, p: SpectrumPlot<'_>) -> PlotBounds {
     let SpectrumPlot {
         id,
         ref title,
@@ -951,7 +1165,10 @@ fn show_single_spectrum(ui: &mut egui::Ui, p: SpectrumPlot<'_>) {
                 plot_ui.line(pk_line);
             }
         }
-    });
+
+        plot_ui.plot_bounds()
+    })
+    .inner
 }
 
 #[cfg(test)]
@@ -981,6 +1198,199 @@ mod tests {
             assert_eq!(history.len(), 1);
             assert_eq!(history.front().unwrap().len(), 200);
         });
+    }
+
+    /// Drive the whole pane — detail picker, both spectrum plots, and the waterfall texture
+    /// build — through a headless egui context.
+    ///
+    /// The waterfall lives at the bottom of a scroll area, so in a running window it is easy
+    /// for it to be culled and never execute. This runs it for real: a screen tall enough that
+    /// nothing is culled, over several frames so the history accumulates and the texture cache
+    /// is exercised on both the miss and the hit.
+    fn drive_spectrum_view(
+        detail: &mut SpectrumDetail,
+        signals: &[ProcessedSignal],
+    ) -> Vec<egui::FullOutput> {
+        let ctx = egui::Context::default();
+        let mut window = FftWindow::BlackmanHarris;
+        signals
+            .iter()
+            .map(|signal| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1600.0, 4000.0),
+                    )),
+                    ..Default::default()
+                };
+                ctx.run_ui(input, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_spectrum_view(ui, &Some(signal.clone()), 4000.0, &mut window, detail);
+                    });
+                })
+            })
+            .collect()
+    }
+
+    /// Build a capture through the real pipeline so the pane sees the shapes it will in the app.
+    fn capture(decim: crate::rfdc::DecimationFactor, complex_out: bool, seq: u64) -> ProcessedSignal {
+        use crate::dsp::{process_adc_block, SpectrumAnalysis};
+        use crate::rfdc::{AdcTile, MixerMode, MixerType};
+        use crate::signal::{SignalGenerator, Tone, ToneModulation};
+
+        let sim_fs = 15000.0;
+        let mut tile = AdcTile::new(0);
+        tile.sample_rate_gsps = 4.0;
+        {
+            let b = &mut tile.blocks[0];
+            b.decimation = decim;
+            b.mixer_settings.mixer_type = MixerType::Fine;
+            b.mixer_settings.mixer_mode = if complex_out {
+                MixerMode::RealToIq
+            } else {
+                MixerMode::RealToReal
+            };
+            b.mixer_settings.freq = -300.0;
+        }
+        let block = tile.blocks[0].clone();
+
+        let sig_gen = SignalGenerator {
+            tones: vec![Tone {
+                frequency_mhz: 300.0,
+                amplitude_dbfs: -6.0,
+                phase_deg: 0.0,
+                bandwidth_mhz: 0.0,
+                modulation: ToneModulation::Cw,
+            }],
+            noise_floor_dbfs: -110.0,
+            noise_enabled: false,
+        };
+        let samples = sig_gen.generate(120_000, sim_fs);
+        let mut out = process_adc_block(
+            &samples,
+            sim_fs,
+            &block,
+            &tile,
+            None,
+            None,
+            SpectrumAnalysis::default(),
+        );
+        out.sequence = seq;
+        out
+    }
+
+    #[test]
+    fn spectrum_view_renders_complex_and_real_outputs() {
+        use crate::rfdc::DecimationFactor;
+
+        for complex_out in [true, false] {
+            WATERFALL_BUFFER.with(|b| b.borrow_mut().clear());
+            WATERFALL_STATE.with(|s| *s.borrow_mut() = WaterfallState::default());
+
+            let captures: Vec<ProcessedSignal> = (1..=4)
+                .map(|seq| capture(DecimationFactor::X16, complex_out, seq))
+                .collect();
+            assert_eq!(captures[0].complex_output, complex_out);
+
+            let mut detail = SpectrumDetail::Balanced;
+            let outputs = drive_spectrum_view(&mut detail, &captures);
+            assert_eq!(outputs.len(), 4);
+
+            // One row per capture, and a texture actually built for them.
+            WATERFALL_BUFFER.with(|b| assert_eq!(b.borrow().len(), 4));
+            WATERFALL_STATE.with(|s| {
+                let s = s.borrow();
+                assert!(s.texture.is_some(), "waterfall texture was never built");
+                let key = s.texture_key.expect("texture built without a key");
+                assert_eq!(key.rows, 4);
+                assert!(key.columns > 0);
+
+                // The texture spans the spectrum's real axis, not an assumed two-sided one.
+                let (lo, hi) = output_span_mhz(captures[0].output_sample_rate_mhz, complex_out);
+                assert!(f64::from_bits(key.x_min_bits) >= lo - 1e-9);
+                assert!(f64::from_bits(key.x_max_bits) <= hi + 1e-9);
+            });
+        }
+    }
+
+    /// A repaint with no new capture must not push a duplicate row — the pipeline runs slower
+    /// than the frame rate, so this happens constantly at high detail.
+    #[test]
+    fn repaints_without_a_new_capture_add_no_rows() {
+        use crate::rfdc::DecimationFactor;
+
+        WATERFALL_BUFFER.with(|b| b.borrow_mut().clear());
+        WATERFALL_STATE.with(|s| *s.borrow_mut() = WaterfallState::default());
+
+        // Same sequence number four times over: one capture, repainted.
+        let one = capture(DecimationFactor::X8, true, 7);
+        let repeats = vec![one.clone(), one.clone(), one.clone(), one];
+
+        let mut detail = SpectrumDetail::Balanced;
+        drive_spectrum_view(&mut detail, &repeats);
+
+        WATERFALL_BUFFER.with(|b| {
+            assert_eq!(
+                b.borrow().len(),
+                1,
+                "repainting the same capture pushed duplicate waterfall rows"
+            )
+        });
+    }
+
+    #[test]
+    fn waterfall_history_trims_to_the_configured_depth() {
+        let mut history: VecDeque<Vec<f64>> = VecDeque::new();
+        for i in 0..40 {
+            history.push_front(vec![i as f64; 8]);
+        }
+
+        // Lowering the depth drops the oldest rows and keeps the newest.
+        let depth = 10;
+        while history.len() > depth {
+            history.pop_back();
+        }
+
+        assert_eq!(history.len(), depth);
+        assert_eq!(history.front().unwrap()[0], 39.0);
+        assert_eq!(history.back().unwrap()[0], 30.0);
+    }
+
+    /// A real-output block's spectrum is one-sided; assuming ±Fout/2 stretched it across twice
+    /// its span and mislabelled every frequency on the waterfall's axis.
+    #[test]
+    fn output_span_matches_the_spectrum_sidedness() {
+        assert_eq!(output_span_mhz(250.0, true), (-125.0, 125.0));
+        assert_eq!(output_span_mhz(250.0, false), (0.0, 125.0));
+    }
+
+    #[test]
+    fn visible_bin_range_covers_the_whole_axis_when_unzoomed() {
+        // Two-sided: the full ±125 MHz view maps to every bin.
+        assert_eq!(visible_bin_range(1024, -125.0, 125.0, -125.0, 125.0), (0, 1024));
+        // One-sided likewise.
+        assert_eq!(visible_bin_range(1024, 0.0, 125.0, 0.0, 125.0), (0, 1024));
+    }
+
+    #[test]
+    fn visible_bin_range_narrows_with_the_view() {
+        // Middle half of a two-sided axis.
+        let (lo, hi) = visible_bin_range(1000, -100.0, 100.0, -50.0, 50.0);
+        assert_eq!((lo, hi), (250, 751));
+
+        // A hard zoom still yields a usable slice rather than an empty one.
+        let (lo, hi) = visible_bin_range(1000, -100.0, 100.0, 0.0, 0.0001);
+        assert!(hi > lo, "zoomed range collapsed to {lo}..{hi}");
+
+        // Views past the axis clamp instead of indexing out of bounds.
+        let (lo, hi) = visible_bin_range(1000, -100.0, 100.0, -500.0, 500.0);
+        assert_eq!((lo, hi), (0, 1000));
+    }
+
+    #[test]
+    fn visible_bin_range_survives_degenerate_input() {
+        assert_eq!(visible_bin_range(0, -1.0, 1.0, -1.0, 1.0), (0, 0));
+        assert_eq!(visible_bin_range(64, 0.0, 0.0, 0.0, 0.0), (0, 64));
     }
 
     fn hanning_tone(n: usize, fs: f64, entries: &[(f64, f64)]) -> Vec<num_complex::Complex<f64>> {
