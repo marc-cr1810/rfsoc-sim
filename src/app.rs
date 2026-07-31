@@ -161,6 +161,11 @@ pub struct RfSocSimApp {
     signal_sequence: u64,
     /// Background thread the signal pipeline runs on.
     worker: CaptureWorker,
+    /// What the last dispatched capture was computed from, while the clock was stopped.
+    ///
+    /// `None` whenever the last dispatch was unconditional — a running clock, or a user asking
+    /// for one outright — so the next paused frame always compares against a real capture.
+    last_capture_fingerprint: Option<u64>,
     /// How long the last capture took, for the status readout.
     last_capture_cost: std::time::Duration,
     /// Signal generator (used when no node graph source is connected).
@@ -212,6 +217,7 @@ impl Default for RfSocSimApp {
             spectrum_detail: dsp::SpectrumDetail::default(),
             signal_sequence: 0,
             worker: CaptureWorker::spawn(),
+            last_capture_fingerprint: None,
             last_capture_cost: std::time::Duration::ZERO,
             signal_gen: SignalGenerator::default(),
             chain_env: ChainEnvironment::default(),
@@ -418,7 +424,9 @@ impl RfSocSimApp {
     }
 
     /// Ask the worker for a capture of the current state, if it is free to take one.
-    fn request_capture(&mut self, ctx: &egui::Context) {
+    ///
+    /// `force` dispatches even when the state has not moved — what the Recompute button wants.
+    fn request_capture(&mut self, ctx: &egui::Context, force: bool) {
         // Checked before building the request, not after: assembling one clones the node graph
         // and the converter config, and this is called every frame while the worker is busy for
         // most of them.
@@ -432,11 +440,58 @@ impl RfSocSimApp {
             return;
         }
 
+        // A running clock puts every capture at a new instant, so there is nothing to compare
+        // and no reason to pay for the comparison. Paused, the inputs usually have not moved at
+        // all, and recomputing a capture that can only come out identical is tens of
+        // milliseconds of the machine spent producing a duplicate.
+        if !force && !self.is_running {
+            let fingerprint = self.capture_fingerprint();
+            if self.last_capture_fingerprint == Some(fingerprint) {
+                return;
+            }
+            self.last_capture_fingerprint = Some(fingerprint);
+        } else {
+            self.last_capture_fingerprint = None;
+        }
+
         self.signal_sequence += 1;
         let sequence = self.signal_sequence;
         if let Some(request) = self.capture_request(ctx, sequence) {
             self.worker.dispatch(request);
         }
+    }
+
+    /// Hash of everything a capture's result depends on.
+    ///
+    /// Serialisation is what the configuration already supports — presets are saved the same way
+    /// — so this covers new settings automatically instead of needing a field adding to it every
+    /// time one is introduced. Only computed while paused, where it stands to save a whole
+    /// capture; a few hundred microseconds against tens of milliseconds.
+    fn capture_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let tile = &self.rfdc.adc_tiles[self.selected_tile];
+        let state = (
+            &self.snarl,
+            tile,
+            &tile.blocks[self.selected_block],
+            &self.signal_gen,
+            self.chain_env,
+            dsp::SpectrumAnalysis { window: self.display_window, detail: self.spectrum_detail },
+        );
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        match serde_json::to_vec(&state) {
+            Ok(bytes) => bytes.hash(&mut hasher),
+            // Unserialisable state cannot be compared, so treat it as always changed.
+            Err(_) => return self.signal_sequence.wrapping_add(1),
+        }
+        self.selected_tile.hash(&mut hasher);
+        self.selected_block.hash(&mut hasher);
+        self.simulation_time_us.to_bits().hash(&mut hasher);
+        (self.active_tab == Tab::Spectrum).hash(&mut hasher);
+        self.dominant_tone_mhz().to_bits().hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Fold a finished capture into the app state.
@@ -602,7 +657,7 @@ impl eframe::App for RfSocSimApp {
         }
         if self.auto_compute {
             let ctx = ui.ctx().clone();
-            self.request_capture(&ctx);
+            self.request_capture(&ctx, false);
         }
 
         // Top panel with tabs and realtime simulation controls
@@ -645,7 +700,7 @@ impl eframe::App for RfSocSimApp {
 
                     if ui.button("🔄 Recompute").clicked() {
                         let ctx = ui.ctx().clone();
-                        self.request_capture(&ctx);
+                        self.request_capture(&ctx, true);
                     }
 
                     ui.separator();
@@ -661,7 +716,7 @@ impl eframe::App for RfSocSimApp {
                                     self.rfdc = state.rfdc;
                                     self.chain_env = state.chain_env;
                                     let ctx = ui.ctx().clone();
-                                    self.request_capture(&ctx);
+                                    self.request_capture(&ctx, true);
                                 }
                             }
                         }
@@ -704,7 +759,7 @@ impl eframe::App for RfSocSimApp {
                     if !self.is_running && ui.button("⏭ Step").clicked() {
                         self.simulation_time_us += 10_000.0 * self.sim_speed; // step 10 ms
                         let ctx = ui.ctx().clone();
-                        self.request_capture(&ctx);
+                        self.request_capture(&ctx, true);
                     }
 
                     let play_label = if self.is_running { "⏸ Pause" } else { "▶ Play" };
@@ -801,7 +856,7 @@ impl eframe::App for RfSocSimApp {
         // even with auto-compute off.
         if window_changed {
             let ctx = ui.ctx().clone();
-            self.request_capture(&ctx);
+            self.request_capture(&ctx, true);
         }
     }
 }
@@ -893,5 +948,63 @@ mod tests {
         // Exactly one capture was accepted, so nothing else is waiting behind it.
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(worker.poll().is_none(), "a queued capture came back; requests were not dropped");
+    }
+
+    /// A paused simulation asked for the same capture every frame would recompute an identical
+    /// result tens of times a second. It should dispatch once, then only when something moves.
+    #[test]
+    fn a_paused_capture_is_not_recomputed_until_something_changes() {
+        let ctx = egui::Context::default();
+        let mut app = RfSocSimApp::default();
+        app.active_tab = Tab::Spectrum;
+        app.is_running = false;
+
+        let dispatched = |app: &mut RfSocSimApp, ctx: &egui::Context| {
+            let before = app.signal_sequence;
+            app.request_capture(ctx, false);
+            // The worker is not polled here, so free it up for the next request.
+            app.worker.in_flight = false;
+            app.signal_sequence != before
+        };
+
+        assert!(dispatched(&mut app, &ctx), "the first paused capture has to run");
+        assert!(!dispatched(&mut app, &ctx), "an unchanged paused state recomputed itself");
+        assert!(!dispatched(&mut app, &ctx), "an unchanged paused state recomputed itself");
+
+        // Anything the result depends on invalidates it: a display setting...
+        app.display_window = match app.display_window {
+            dsp::FftWindow::Hanning => dsp::FftWindow::FlatTop,
+            _ => dsp::FftWindow::Hanning,
+        };
+        assert!(dispatched(&mut app, &ctx), "changing the window should recompute");
+        assert!(!dispatched(&mut app, &ctx));
+
+        // ...a hardware setting...
+        app.rfdc.adc_tiles[app.selected_tile].blocks[app.selected_block].mixer_settings.freq += 1.0;
+        assert!(dispatched(&mut app, &ctx), "changing the NCO should recompute");
+
+        // ...the signal itself...
+        app.signal_gen.tones[0].frequency_mhz += 1.0;
+        assert!(dispatched(&mut app, &ctx), "changing a tone should recompute");
+
+        // ...and the clock moving on, as the Step button does.
+        app.simulation_time_us += 10_000.0;
+        assert!(dispatched(&mut app, &ctx), "stepping the clock should recompute");
+        assert!(!dispatched(&mut app, &ctx));
+
+        // Asking outright always runs, however still the state is.
+        let before = app.signal_sequence;
+        app.request_capture(&ctx, true);
+        assert_ne!(before, app.signal_sequence, "Recompute must dispatch regardless");
+
+        // And a running clock is never deduplicated: every frame is a new instant.
+        app.worker.in_flight = false;
+        app.is_running = true;
+        assert!(dispatched(&mut app, &ctx));
+        app.is_running = false;
+        assert!(
+            dispatched(&mut app, &ctx),
+            "pausing after a free-running capture must not compare against a stale fingerprint"
+        );
     }
 }

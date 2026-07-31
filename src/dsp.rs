@@ -98,6 +98,109 @@ pub(crate) const PAR_MIN_LEN: usize = 32_768;
 /// hand-off, short enough that the last chunk cannot leave the other workers idle for long.
 pub(crate) const PAR_CHUNK: usize = 8_192;
 
+/// Reusable working buffers for the capture pipeline.
+///
+/// The wideband stages allocate megabytes per capture and free them again at the end of it. The
+/// allocator hands blocks that size straight back to the kernel, so the next capture faults
+/// every page back in one at a time — about a third of a `Max` capture's cost, spent on nothing
+/// but zeroing memory that was already ours. Parking the allocations in a per-thread pool
+/// removes that without changing a single arithmetic operation.
+///
+/// A thread holds at most [`POOL_LIMIT`] buffers of each type, so what it retains is roughly one
+/// capture's working set rather than a growing hoard.
+mod scratch {
+    use super::Complex;
+    use std::cell::RefCell;
+
+    /// Buffers of each type a thread keeps parked. The pipeline holds a handful alive at once.
+    const POOL_LIMIT: usize = 8;
+
+    thread_local! {
+        static REALS: RefCell<Vec<Vec<f64>>> = const { RefCell::new(Vec::new()) };
+        static COMPLEX: RefCell<Vec<Vec<Complex<f64>>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Take a buffer with room for `len`, emptied — for a caller that will `extend` into it.
+    macro_rules! take_empty {
+        ($pool:expr, $len:expr) => {
+            $pool.with(|p| {
+                let mut p = p.borrow_mut();
+                let idx = p.iter().position(|b: &Vec<_>| b.capacity() >= $len);
+                let mut v = match idx {
+                    Some(i) => p.swap_remove(i),
+                    None => p.pop().unwrap_or_default(),
+                };
+                v.clear();
+                v.reserve($len);
+                v
+            })
+        };
+    }
+
+    /// Hand a buffer back, unless this thread is already holding enough of them.
+    macro_rules! give {
+        ($pool:expr, $v:expr) => {
+            $pool.with(|p| {
+                let mut p = p.borrow_mut();
+                if p.len() < POOL_LIMIT {
+                    p.push($v);
+                }
+            })
+        };
+    }
+
+    /// An empty `f64` buffer with room for `len`.
+    pub fn reals(len: usize) -> Vec<f64> {
+        take_empty!(REALS, len)
+    }
+
+    /// `len` zeroed `f64`s, for a stage that writes its output by index.
+    pub fn reals_zeroed(len: usize) -> Vec<f64> {
+        let mut v = reals(len);
+        v.resize(len, 0.0);
+        v
+    }
+
+    /// An empty complex buffer with room for `len`.
+    pub fn complex(len: usize) -> Vec<Complex<f64>> {
+        take_empty!(COMPLEX, len)
+    }
+
+    /// `len` zeroed complex samples, for a stage that writes its output by index.
+    pub fn complex_zeroed(len: usize) -> Vec<Complex<f64>> {
+        let mut v = complex(len);
+        v.resize(len, Complex::new(0.0, 0.0));
+        v
+    }
+
+    /// `len` complex samples of *whatever the last user left there*.
+    ///
+    /// Only for a caller that writes every element before reading any of it — a transpose, say.
+    /// Skipping the zero fill is the point: on a repeat of the same capture size nothing is
+    /// written at all, where `complex_zeroed` would memset megabytes each time.
+    pub fn complex_overwritten(len: usize) -> Vec<Complex<f64>> {
+        COMPLEX.with(|p| {
+            let mut p = p.borrow_mut();
+            let idx = p.iter().position(|b: &Vec<_>| b.capacity() >= len);
+            let mut v = match idx {
+                Some(i) => p.swap_remove(i),
+                None => p.pop().unwrap_or_default(),
+            };
+            v.resize(len, Complex::new(0.0, 0.0));
+            v.truncate(len);
+            v
+        })
+    }
+
+    pub fn recycle_reals(v: Vec<f64>) {
+        give!(REALS, v);
+    }
+
+    pub fn recycle_complex(v: Vec<Complex<f64>>) {
+        give!(COMPLEX, v);
+    }
+}
+
 /// Split `out` into [`PAR_CHUNK`]-sized pieces and run `fill(first_index, piece)` over each.
 ///
 /// The split is by index and never by thread, so the same buffer is always divided the same
@@ -270,7 +373,9 @@ impl std::fmt::Display for FftWindow {
 /// imaginary half is known to be zero, which halves the memory traffic of the widest buffers
 /// in the program and lets the per-sample loops vectorise.
 pub fn physical_voltage(samples: &[Complex<f64>]) -> Vec<f64> {
-    samples.iter().map(|s| s.re).collect()
+    let mut out = scratch::reals(samples.len());
+    out.extend(samples.iter().map(|s| s.re));
+    out
 }
 
 /// Apply the converter's analog input bandwidth roll-off to the wideband voltage waveform.
@@ -283,21 +388,16 @@ pub fn apply_analog_bandwidth(
     afe: &crate::rfdc::AnalogFrontEnd,
 ) -> Vec<f64> {
     if !afe.enabled || samples.len() < 2 || sample_rate_mhz <= 0.0 {
-        return samples.to_vec();
+        let mut out = scratch::reals(samples.len());
+        out.extend_from_slice(samples);
+        return out;
     }
 
     let n = samples.len();
-    let (fft, ifft) = REAL_FFT_PLANNER.with(|planner| {
-        let mut planner = planner.borrow_mut();
-        (planner.plan_fft_forward(n), planner.plan_fft_inverse(n))
-    });
 
     // The signal is real, so the transform is conjugate-symmetric and only the non-negative
     // half of the bins exists. That is also why the gain table is half length.
-    let mut input = samples.to_vec();
-    let mut spectrum = fft.make_output_vec();
-    fft.process(&mut input, &mut spectrum)
-        .expect("real FFT length mismatch");
+    let mut spectrum = real_fft_forward(samples);
 
     // Scale each bin by the analog response. The curve is real and even, and depends only on
     // the bin grid and the AFE settings, so it is built once and reused rather than evaluated
@@ -307,14 +407,256 @@ pub fn apply_analog_bandwidth(
         *bin *= g;
     }
 
-    let mut out = vec![0.0; n];
-    ifft.process(&mut spectrum, &mut out)
-        .expect("real inverse FFT length mismatch");
+    let mut out = real_fft_inverse(&mut spectrum, n);
+    scratch::recycle_complex(spectrum);
     let norm = 1.0 / n as f64;
     for v in out.iter_mut() {
         *v *= norm;
     }
     out
+}
+
+/// Forward transform of a real signal, giving its `n/2 + 1` non-negative-frequency bins.
+fn real_fft_forward(samples: &[f64]) -> Vec<Complex<f64>> {
+    let n = samples.len();
+    if let Some(bins) = parallel_real_fft_forward(samples) {
+        return bins;
+    }
+    let fft = REAL_FFT_PLANNER.with(|planner| planner.borrow_mut().plan_fft_forward(n));
+    let mut input = scratch::reals(n);
+    input.extend_from_slice(samples);
+    let mut spectrum = scratch::complex_zeroed(n / 2 + 1);
+    fft.process(&mut input, &mut spectrum)
+        .expect("real FFT length mismatch");
+    scratch::recycle_reals(input);
+    spectrum
+}
+
+/// Inverse of [`real_fft_forward`], unnormalised — the caller divides by `n`.
+///
+/// Consumes the spectrum: the transform is free to scribble on its input.
+fn real_fft_inverse(spectrum: &mut [Complex<f64>], n: usize) -> Vec<f64> {
+    if let Some(out) = parallel_real_fft_inverse(spectrum, n) {
+        return out;
+    }
+    let ifft = REAL_FFT_PLANNER.with(|planner| planner.borrow_mut().plan_fft_inverse(n));
+    let mut out = scratch::reals_zeroed(n);
+    ifft.process(spectrum, &mut out)
+        .expect("real inverse FFT length mismatch");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Multi-threaded transforms for the wideband record
+// ---------------------------------------------------------------------------
+
+/// Shortest transform worth splitting across the pool.
+///
+/// Below this the sub-transforms and the transposes between them cost more than the single
+/// long pass they replace, and rustfft's own AVX kernels are already running flat out.
+const PARALLEL_FFT_MIN: usize = 1 << 16;
+
+/// Rows one task takes at a time, so it can amortise a single FFT scratch allocation.
+const FFT_ROWS_PER_TASK: usize = 8;
+
+/// Factor `n` into the two roughly equal halves the four-step decomposition needs.
+///
+/// Powers of two only. Anything else falls back to the single-threaded path rather than
+/// growing a general mixed-radix case for lengths this program never uses.
+fn fft_split(n: usize) -> Option<(usize, usize)> {
+    if !n.is_power_of_two() || n < PARALLEL_FFT_MIN {
+        return None;
+    }
+    let n1 = 1usize << (n.trailing_zeros() / 2);
+    Some((n1, n / n1))
+}
+
+/// `dst[j·rows + i] = src[i·cols + j]`, in cache-sized blocks and across the pool.
+///
+/// Each task owns a stripe of destination rows, so no two tasks write the same memory.
+fn transpose(src: &[Complex<f64>], dst: &mut [Complex<f64>], rows: usize, cols: usize) {
+    /// Square block that keeps both the read and the write side in cache.
+    const BLOCK: usize = 32;
+    dst.par_chunks_mut(BLOCK * rows).enumerate().for_each(|(stripe, out)| {
+        let j0 = stripe * BLOCK;
+        for i0 in (0..rows).step_by(BLOCK) {
+            for j in j0..(j0 + BLOCK).min(cols) {
+                for i in i0..(i0 + BLOCK).min(rows) {
+                    out[(j - j0) * rows + i] = src[i * cols + j];
+                }
+            }
+        }
+    });
+}
+
+/// Transform `buf` in place as `n2` transforms of length `n1` and then `n1` of length `n2`.
+///
+/// This is the textbook `N = N1·N2` factorisation of the DFT — the same one every mixed-radix
+/// FFT is built from — so it computes the same transform as a single long pass, differing only
+/// in the order the identical butterflies are evaluated. What it buys is that both halves are
+/// hundreds of independent short transforms, which the thread pool can take in parallel, where
+/// one long transform is stuck on a single core.
+///
+/// Returns `false` if `n` is not a length it handles, leaving `buf` untouched.
+fn parallel_fft(buf: &mut [Complex<f64>], inverse: bool) -> bool {
+    let n = buf.len();
+    let Some((n1, n2)) = fft_split(n) else {
+        return false;
+    };
+
+    let (inner1, inner2) = FFT_PLANNER.with(|planner| {
+        let mut planner = planner.borrow_mut();
+        if inverse {
+            (planner.plan_fft_inverse(n1), planner.plan_fft_inverse(n2))
+        } else {
+            (planner.plan_fft_forward(n1), planner.plan_fft_forward(n2))
+        }
+    });
+
+    // Rows of the transform run along the *other* axis each pass, so each pass is preceded by
+    // a transpose that makes its vectors contiguous.
+    let mut a = scratch::complex_overwritten(n);
+    let mut b = scratch::complex_overwritten(n);
+
+    // Pass 1: the length-`n1` transforms, over what were columns of the input.
+    transpose(buf, &mut a, n1, n2);
+    let sign = if inverse { 1.0 } else { -1.0 };
+    a.par_chunks_mut(n1 * FFT_ROWS_PER_TASK)
+        .enumerate()
+        .for_each(|(task, block)| {
+            let mut fft_scratch = vec![Complex::new(0.0, 0.0); inner1.get_inplace_scratch_len()];
+            for (r, row) in block.chunks_mut(n1).enumerate() {
+                inner1.process_with_scratch(row, &mut fft_scratch);
+                // Then the twiddle factor W_N^{row·col}, stepped along the row rather than
+                // evaluated per element — the same recurrence the NCO uses.
+                let row_idx = task * FFT_ROWS_PER_TASK + r;
+                let step = sign * 2.0 * PI * row_idx as f64 / n as f64;
+                let rot = Complex::new(step.cos(), step.sin());
+                let mut z = Complex::new(1.0, 0.0);
+                for (col, v) in row.iter_mut().enumerate() {
+                    *v *= z;
+                    z *= rot;
+                    if col % PHASOR_RENORM_INTERVAL == 0 {
+                        z /= z.norm();
+                    }
+                }
+            }
+        });
+
+    // Pass 2: the length-`n2` transforms, over what are now columns of `a`.
+    transpose(&a, &mut b, n2, n1);
+    b.par_chunks_mut(n2 * FFT_ROWS_PER_TASK).for_each(|block| {
+        let mut fft_scratch = vec![Complex::new(0.0, 0.0); inner2.get_inplace_scratch_len()];
+        for row in block.chunks_mut(n2) {
+            inner2.process_with_scratch(row, &mut fft_scratch);
+        }
+    });
+
+    // And back into the natural bin order.
+    transpose(&b, buf, n1, n2);
+
+    scratch::recycle_complex(a);
+    scratch::recycle_complex(b);
+    true
+}
+
+/// [`real_fft_forward`] via [`parallel_fft`], or `None` if the length does not suit it.
+///
+/// A real signal of length `n` is packed into `n/2` complex samples — the even samples on the
+/// real axis, the odd ones on the imaginary — transformed at half length, and unpacked. That
+/// is what `realfft` does too; doing it here is what lets the transform underneath be the
+/// parallel one.
+fn parallel_real_fft_forward(samples: &[f64]) -> Option<Vec<Complex<f64>>> {
+    let n = samples.len();
+    if n % 2 != 0 {
+        return None;
+    }
+    let half = n / 2;
+    fft_split(half)?;
+
+    let mut packed = scratch::complex(half);
+    packed.extend(samples.chunks_exact(2).map(|p| Complex::new(p[0], p[1])));
+    parallel_fft(&mut packed, false);
+
+    let mut bins = scratch::complex_overwritten(half + 1);
+    // DC and Nyquist are the two real bins, and both come out of Z[0] alone.
+    let z0 = packed[0];
+    bins[0] = Complex::new(z0.re + z0.im, 0.0);
+    bins[half] = Complex::new(z0.re - z0.im, 0.0);
+
+    // X[k] = E[k] + W_n^k · O[k], where E and O are the transforms of the even and odd samples,
+    // recovered from the packed transform's conjugate-symmetric halves.
+    let step = -2.0 * PI / n as f64;
+    let rot = Complex::new(step.cos(), step.sin());
+    for_each_chunk(&mut bins[1..half], |base, out| {
+        let k0 = base + 1;
+        // W_n^k over the chunk, stepped rather than evaluated per bin.
+        let start = step * k0 as f64;
+        let mut w = Complex::new(start.cos(), start.sin());
+        for (i, slot) in out.iter_mut().enumerate() {
+            let k = k0 + i;
+            let (a, b) = (packed[k], packed[half - k].conj());
+            let even = (a + b) * 0.5;
+            let odd = (a - b) * Complex::new(0.0, -0.5);
+            *slot = even + w * odd;
+            w *= rot;
+            if i % PHASOR_RENORM_INTERVAL == 0 {
+                w /= w.norm();
+            }
+        }
+    });
+
+    scratch::recycle_complex(packed);
+    Some(bins)
+}
+
+/// [`real_fft_inverse`] via [`parallel_fft`], or `None` if the length does not suit it.
+///
+/// The exact inverse of [`parallel_real_fft_forward`]'s packing, and unnormalised to match the
+/// single-threaded path it stands in for.
+fn parallel_real_fft_inverse(bins: &[Complex<f64>], n: usize) -> Option<Vec<f64>> {
+    if n % 2 != 0 || bins.len() != n / 2 + 1 {
+        return None;
+    }
+    let half = n / 2;
+    fft_split(half)?;
+
+    let mut packed = scratch::complex_overwritten(half);
+    let step = 2.0 * PI / n as f64;
+    let rot = Complex::new(step.cos(), step.sin());
+    for_each_chunk(&mut packed, |base, out| {
+        let start = step * base as f64;
+        let mut w = Complex::new(start.cos(), start.sin());
+        for (i, slot) in out.iter_mut().enumerate() {
+            let k = base + i;
+            // X[k] and its mirror give back the even and odd transforms; the mirror of bin 0
+            // is the Nyquist bin.
+            let (a, b) = (bins[k], bins[half - k].conj());
+            let even = (a + b) * 0.5;
+            let odd = (a - b) * 0.5 * w;
+            *slot = even + Complex::new(0.0, 1.0) * odd;
+            w *= rot;
+            if i % PHASOR_RENORM_INTERVAL == 0 {
+                w /= w.norm();
+            }
+        }
+    });
+
+    parallel_fft(&mut packed, true);
+
+    // The half-length inverse leaves the record scaled by n/2 where the caller expects n, and
+    // interleaved as it was packed.
+    let mut out = scratch::reals_zeroed(n);
+    for_each_chunk(&mut out, |base, dst| {
+        for (i, slot) in dst.iter_mut().enumerate() {
+            let j = base + i;
+            let z = packed[j / 2];
+            *slot = 2.0 * if j % 2 == 0 { z.re } else { z.im };
+        }
+    });
+
+    scratch::recycle_complex(packed);
+    Some(out)
 }
 
 /// Identifies an analog-bandwidth gain curve: the bin grid, and the response over it.
@@ -371,8 +713,22 @@ pub fn apply_analog_non_idealities(
     samples: &[f64],
     non_idealities: &crate::rfdc::AdcNonIdealities,
 ) -> Vec<f64> {
+    let mut out = scratch::reals(samples.len());
+    out.extend_from_slice(samples);
+    apply_analog_non_idealities_in_place(&mut out, non_idealities);
+    out
+}
+
+/// [`apply_analog_non_idealities`] for a caller that already owns the buffer.
+///
+/// The distortion is pointwise, so there is nothing to gain from a second copy of a record this
+/// wide — and the AFE stage before it hands over a buffer it no longer needs.
+pub fn apply_analog_non_idealities_in_place(
+    samples: &mut [f64],
+    non_idealities: &crate::rfdc::AdcNonIdealities,
+) {
     if !non_idealities.enabled || samples.is_empty() {
-        return samples.to_vec();
+        return;
     }
 
     // For an input A·cos(θ), a2·v² produces a second harmonic of amplitude a2·A²/2 and
@@ -398,21 +754,22 @@ pub fn apply_analog_non_idealities(
         0.0
     };
 
-    let distort = |&v: &f64| {
-        let mut out = v;
+    // Both terms are driven by the undistorted sample: they are separate products of the same
+    // input, not a chain.
+    let distort = |v: &mut f64| {
+        let x = *v;
         if a2 > 0.0 {
-            out += a2 * (v * v - mean_sq);
+            *v += a2 * (x * x - mean_sq);
         }
         if a3 > 0.0 {
-            out += a3 * v * v * v;
+            *v += a3 * x * x * x;
         }
-        out
     };
 
     if samples.len() >= PAR_MIN_LEN {
-        samples.par_iter().with_min_len(PAR_CHUNK).map(distort).collect()
+        samples.par_iter_mut().with_min_len(PAR_CHUNK).for_each(distort);
     } else {
-        samples.iter().map(distort).collect()
+        samples.iter_mut().for_each(distort);
     }
 }
 
@@ -523,7 +880,7 @@ pub fn apply_digital_non_idealities(
         overrange
     };
 
-    let mut processed = vec![0.0; samples.len()];
+    let mut processed = scratch::reals_zeroed(samples.len());
     let overrange = any_chunk(&mut processed, run);
 
     (processed, overrange)
@@ -586,15 +943,20 @@ pub fn process_adc_block(
     // Collapse to the real voltage actually present at the converter pin before doing
     // anything else, so every downstream spectrum shares one amplitude reference.
     let dsa_samples: Vec<f64> = if dsa_scale < 1.0 {
-        input_samples.iter().map(|s| s.re * dsa_scale).collect()
+        let mut v = scratch::reals(input_samples.len());
+        v.extend(input_samples.iter().map(|s| s.re * dsa_scale));
+        v
     } else {
         physical_voltage(input_samples)
     };
 
-    // 1. Analog input bandwidth roll-off of the track-and-hold, then HD2/HD3 (pre-sampling)
-    let afe_samples =
+    // 1. Analog input bandwidth roll-off of the track-and-hold, then HD2/HD3 (pre-sampling).
+    // The distortion runs in place on the bandwidth stage's output: it is pointwise, and a
+    // second copy of a record this wide is pure memory traffic.
+    let mut analog_samples =
         apply_analog_bandwidth(&dsa_samples, input_sample_rate_mhz, &block.analog_front_end);
-    let analog_samples = apply_analog_non_idealities(&afe_samples, &block.non_idealities);
+    scratch::recycle_reals(dsa_samples);
+    apply_analog_non_idealities_in_place(&mut analog_samples, &block.non_idealities);
 
     // A high `detail` lengthens the capture for the DDC output's benefit; these panes look at
     // the same samples, so they take whatever length is going. See `analysis_fft_size`.
@@ -613,7 +975,10 @@ pub fn process_adc_block(
     );
 
     let raw_source_spectrum_dbfs = raw_source_samples.map(|samples| {
-        let real_source = physical_voltage(samples);
+        // Only the samples the transform will actually read: this pane is the one consumer of
+        // the source record, and it looks at `wide_fft` of them however long the capture is.
+        let analysed = wide_fft.min(samples.len());
+        let real_source = physical_voltage(&samples[..analysed]);
         // Matched to the input pane's length: the two are drawn overlaid, and transforms of
         // different lengths would put their noise floors at different levels.
         let (raw_spec, _) = compute_spectrum_positive_padded_real(
@@ -623,6 +988,7 @@ pub fn process_adc_block(
             display_window,
             wide_pad,
         );
+        scratch::recycle_reals(real_source);
         raw_spec
     });
 
@@ -714,6 +1080,14 @@ pub fn process_adc_block(
         None => (None, None),
     };
 
+    // Park the working buffers for the next capture. Everything here has been read for the
+    // last time; what leaves in `ProcessedSignal` is not recycled.
+    scratch::recycle_reals(analog_samples);
+    scratch::recycle_reals(tile_samples_analog);
+    scratch::recycle_reals(tile_samples);
+    scratch::recycle_complex(mixed_samples);
+    scratch::recycle_complex(qmc_samples);
+
     ProcessedSignal {
         raw_source_spectrum_dbfs,
         input_spectrum_dbfs: input_spectrum,
@@ -753,7 +1127,8 @@ fn windowed_padded_fft(
     window: FftWindow,
     pad: usize,
 ) -> Vec<Complex<f64>> {
-    let mut buffer: Vec<Complex<f64>> = samples[..n].to_vec();
+    let mut buffer = scratch::complex(n * pad.max(1));
+    buffer.extend_from_slice(&samples[..n]);
     window.apply(&mut buffer);
     // Pad after windowing: windowing the zeros would taper them into the real samples.
     buffer.resize(n * pad.max(1), Complex::new(0.0, 0.0));
@@ -773,14 +1148,16 @@ fn windowed_padded_rfft(
     window: FftWindow,
     pad: usize,
 ) -> Vec<Complex<f64>> {
-    let mut buffer: Vec<f64> = samples[..n].to_vec();
+    let mut buffer = scratch::reals(n * pad.max(1));
+    buffer.extend_from_slice(&samples[..n]);
     window.apply_real(&mut buffer);
     buffer.resize(n * pad.max(1), 0.0);
     let len = buffer.len();
     let fft = REAL_FFT_PLANNER.with(|planner| planner.borrow_mut().plan_fft_forward(len));
-    let mut spectrum = fft.make_output_vec();
+    let mut spectrum = scratch::complex_zeroed(len / 2 + 1);
     fft.process(&mut buffer, &mut spectrum)
         .expect("real FFT length mismatch");
+    scratch::recycle_reals(buffer);
     spectrum
 }
 
@@ -821,6 +1198,7 @@ pub fn compute_spectrum_padded(
     // length — the padding contributes no energy, so scaling by it would under-read every bin.
     let norm = 1.0 / (n as f64 * window.coherent_gain());
     let spectrum_dbfs = bins_to_dbfs(&buffer, norm);
+    scratch::recycle_complex(buffer);
 
     // FFT-shift: move DC to centre
     let mut shifted = vec![0.0; len];
@@ -873,11 +1251,10 @@ pub fn compute_spectrum_positive_padded(
     let len = buffer.len();
     let half = len / 2;
     let norm = 1.0 / (n as f64 * window.coherent_gain());
+    let dbfs = positive_bins_to_dbfs(&buffer[..=half], norm);
+    scratch::recycle_complex(buffer);
 
-    (
-        positive_bins_to_dbfs(&buffer[..=half], norm),
-        positive_freq_axis(len, sample_rate_mhz),
-    )
+    (dbfs, positive_freq_axis(len, sample_rate_mhz))
 }
 
 /// Single-sided power spectrum of a *real* signal, zero-padded by `pad`.
@@ -899,11 +1276,10 @@ pub fn compute_spectrum_positive_padded_real(
     let bins = windowed_padded_rfft(samples, n, window, pad);
     let len = n * pad.max(1);
     let norm = 1.0 / (n as f64 * window.coherent_gain());
+    let dbfs = positive_bins_to_dbfs(&bins, norm);
+    scratch::recycle_complex(bins);
 
-    (
-        positive_bins_to_dbfs(&bins, norm),
-        positive_freq_axis(len, sample_rate_mhz),
-    )
+    (dbfs, positive_freq_axis(len, sample_rate_mhz))
 }
 
 /// dBFS for the non-negative half of a transform, `bins[0]` being DC and `bins[half]` Nyquist.
@@ -1081,7 +1457,7 @@ pub fn sample_adc_at_tile_rate(
         }
     };
 
-    let mut sampled = vec![0.0; num_samples];
+    let mut sampled = scratch::reals_zeroed(num_samples);
     for_each_chunk(&mut sampled, run);
 
     sampled
@@ -1112,7 +1488,9 @@ pub fn apply_qmc(
 ) -> Vec<Complex<f64>> {
     // No-op passthrough when settings are at defaults
     if (qmc.gain - 1.0).abs() < 1e-12 && qmc.phase.abs() < 1e-12 && qmc.offset.abs() < 1e-12 {
-        return samples.to_vec();
+        let mut out = scratch::complex(samples.len());
+        out.extend_from_slice(samples);
+        return out;
     }
 
     let phase_rad = qmc.phase * PI / 180.0;
@@ -1126,11 +1504,13 @@ pub fn apply_qmc(
         Complex::new(i_out, q_out)
     };
 
+    let mut out = scratch::complex(samples.len());
     if samples.len() >= PAR_MIN_LEN {
-        samples.par_iter().with_min_len(PAR_CHUNK).map(correct).collect()
+        out.par_extend(samples.par_iter().with_min_len(PAR_CHUNK).map(correct));
     } else {
-        samples.iter().map(correct).collect()
+        out.extend(samples.iter().map(correct));
     }
+    out
 }
 
 /// Apply the DDC mixer to the real samples coming off the converter.
@@ -1153,7 +1533,9 @@ pub fn apply_mixer(
     let phase0 = settings.phase_offset * PI / 180.0;
 
     let bypass = || -> Vec<Complex<f64>> {
-        samples.iter().map(|&v| Complex::new(v, 0.0)).collect()
+        let mut out = scratch::complex(samples.len());
+        out.extend(samples.iter().map(|&v| Complex::new(v, 0.0)));
+        out
     };
 
     let omega = match settings.mixer_type {
@@ -1201,7 +1583,7 @@ fn mix_with_nco(samples: &[f64], omega: f64, phase0: f64, scale: f64) -> Vec<Com
         }
     };
 
-    let mut mixed = vec![Complex::new(0.0, 0.0); samples.len()];
+    let mut mixed = scratch::complex_zeroed(samples.len());
     for_each_chunk(&mut mixed, run);
     mixed
 }
@@ -1485,7 +1867,7 @@ impl DecimationChain {
             }
         };
 
-        let mut out = vec![Complex::new(0.0, 0.0); out_len];
+        let mut out = scratch::complex_zeroed(out_len);
         // Each output costs one pass over the taps, so it is the product that decides whether
         // the stage is worth spreading — a short buffer through a long filter still is.
         if out_len * taps.len() >= PAR_MIN_LEN {
@@ -1501,7 +1883,9 @@ impl DecimationChain {
     /// Filter and downsample, returning only fully settled output samples.
     pub fn apply(&self, samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
         if self.stages.is_empty() {
-            return samples.to_vec();
+            let mut out = scratch::complex(samples.len());
+            out.extend_from_slice(samples);
+            return out;
         }
         // The first stage reads the caller's buffer directly. Copying it in only to filter out
         // of it is megabytes of traffic for nothing, and every later stage is already writing
@@ -1509,7 +1893,9 @@ impl DecimationChain {
         let mut current = Vec::new();
         for (i, stage) in self.stages.iter().enumerate() {
             let input = if i == 0 { samples } else { &current };
-            current = Self::run_stage(input, &stage.taps, stage.factor);
+            let next = Self::run_stage(input, &stage.taps, stage.factor);
+            // The stage just read its input for the last time.
+            scratch::recycle_complex(std::mem::replace(&mut current, next));
         }
         if self.warmup_out_samples < current.len() {
             current.drain(..self.warmup_out_samples);
@@ -3272,6 +3658,73 @@ mod tests {
             bh_skirt > han_skirt + 20.0,
             "Blackman-Harris should push the leakage skirt far below Hanning's; got {bh_skirt:.1} vs {han_skirt:.1} dB"
         );
+    }
+
+    /// The threaded transform is a scheduling change, not a modelling one: the factorisation
+    /// evaluates the same butterflies in a different order, so it has to agree with the
+    /// single-threaded transform to the last few bits — checked both ways round, and at the
+    /// lengths the wideband record actually uses.
+    #[test]
+    fn parallel_transform_matches_the_single_threaded_one() {
+        // A real transform of `n` runs a complex one of `n/2`, so `n` has to be twice
+        // the threshold to qualify at all.
+        for n in [2 * PARALLEL_FFT_MIN, 1 << 18, 1 << 19] {
+            // Something with structure and something without, so a bin-aligned tone cannot
+            // hide an indexing mistake that broadband noise would expose.
+            let mut seed = 0x1234_5678_9ABC_DEF0u64;
+            let x: Vec<f64> = (0..n)
+                .map(|i| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let noise = (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+                    (2.0 * PI * 97.0 * i as f64 / n as f64).cos() + 0.25 * noise
+                })
+                .collect();
+
+            // Forward: against realfft, which is what the fallback path uses.
+            let parallel = parallel_real_fft_forward(&x).expect("length should qualify");
+            let fft = REAL_FFT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
+            let mut input = x.clone();
+            let mut reference = fft.make_output_vec();
+            fft.process(&mut input, &mut reference).unwrap();
+
+            let scale = reference.iter().map(|c| c.norm()).fold(0.0_f64, f64::max);
+            let worst = parallel
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).norm())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                worst < 1e-9 * scale,
+                "n = {n}: forward differs by {worst:.3e} against a peak of {scale:.3e}"
+            );
+
+            // Inverse: round-tripping has to give the record back, scaled by n as the
+            // single-threaded path scales it.
+            let mut spectrum = parallel.clone();
+            let back = parallel_real_fft_inverse(&mut spectrum, n).expect("length should qualify");
+            let worst = back
+                .iter()
+                .zip(&x)
+                .map(|(a, b)| (a / n as f64 - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(worst < 1e-12, "n = {n}: round trip differs by {worst:.3e}");
+
+            // And against realfft's inverse on the same spectrum, bit for bit in practice.
+            let ifft = REAL_FFT_PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(n));
+            let mut spectrum = parallel.clone();
+            let mut ref_back = vec![0.0; n];
+            ifft.process(&mut spectrum, &mut ref_back).unwrap();
+            let scale = ref_back.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+            let worst = back
+                .iter()
+                .zip(&ref_back)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                worst < 1e-9 * scale,
+                "n = {n}: inverse differs by {worst:.3e} against a peak of {scale:.3e}"
+            );
+        }
     }
 
     /// The real-input transform is a speed change, not a modelling one: it has to agree with
