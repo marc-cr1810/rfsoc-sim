@@ -55,6 +55,9 @@ pub struct RfSocSimApp {
     pub processed_signal: Option<ProcessedSignal>,
     /// Whether to auto-recompute the spectrum.
     pub auto_compute: bool,
+    /// FFT window used for every displayed spectrum. A display choice, not hardware — it
+    /// trades main-lobe width against how far a tone's leakage skirt spreads across the trace.
+    pub display_window: dsp::FftWindow,
     /// Signal generator (used when no node graph source is connected).
     pub signal_gen: SignalGenerator,
     /// Physical environment of the RF chain: temperature and thermal noise.
@@ -100,6 +103,7 @@ impl Default for RfSocSimApp {
             active_tab: Tab::Overview,
             processed_signal: None,
             auto_compute: true,
+            display_window: dsp::DEFAULT_DISPLAY_WINDOW,
             signal_gen: SignalGenerator::default(),
             chain_env: ChainEnvironment::default(),
             chain_budget: None,
@@ -359,6 +363,7 @@ impl RfSocSimApp {
             tile,
             Some(&raw_samples),
             rf_chain_response,
+            self.display_window,
         ));
     }
 }
@@ -514,6 +519,10 @@ impl eframe::App for RfSocSimApp {
             });
 
         // Central region content — determined by active tab
+        // The window picker lives in the spectrum pane, so its change has to be reported back
+        // out here where recompute is reachable.
+        let mut window_changed = false;
+
         match self.active_tab {
             Tab::Overview => {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -545,13 +554,20 @@ impl eframe::App for RfSocSimApp {
             Tab::Spectrum => {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let tile = &self.rfdc.adc_tiles[self.selected_tile];
-                    spectrum_view::show_spectrum_view(
+                    let fs_mhz = tile.sample_rate_mhz();
+                    window_changed = spectrum_view::show_spectrum_view(
                         ui,
                         &self.processed_signal,
-                        tile.sample_rate_mhz(),
+                        fs_mhz,
+                        &mut self.display_window,
                     );
                 });
             }
+        }
+
+        // Auto-compute already refreshes every frame; this covers the manual case.
+        if window_changed && !self.auto_compute {
+            self.recompute_signal();
         }
     }
 }

@@ -42,6 +42,14 @@ pub struct ProcessedSignal {
     pub output_freq_axis_mhz: Vec<f64>,
     /// Effective output sample rate in MHz.
     pub output_sample_rate_mhz: f64,
+    /// Window used for every spectrum here. Peak picking needs it to know what a tone's own
+    /// leakage skirt looks like, so it travels with the data rather than being assumed.
+    pub display_window: FftWindow,
+    /// Resolution bandwidth of the output spectrum, in MHz: the span divided by the number of
+    /// samples actually transformed. The trace carries more points than this after display
+    /// padding, so anything that reasons about how far apart two features really are — peak
+    /// picking, marker readouts — has to use this rather than the point spacing.
+    pub output_rbw_mhz: f64,
     /// Complex baseband output time-domain samples (for oscilloscope & constellation).
     pub output_time_samples: Vec<Complex<f64>>,
     /// True if the physical ADC waveform clipped at any point during this capture.
@@ -129,6 +137,41 @@ impl FftWindow {
             FftWindow::FlatTop => 0.21557895,
             FftWindow::Rectangular => 1.0,
         }
+    }
+
+    /// Main-lobe half-width in RBW bins, the sidelobe plateau level (dB below the peak) and
+    /// where it ends, and the roll-off beyond it in dB per octave of distance.
+    ///
+    /// Fitted to each window's own transform so the envelope stays *under* the real sidelobes
+    /// — the published first-sidelobe-and-slope figures don't bound them, because the first
+    /// few sidelobes sit well above a line drawn from the first one. Checked by
+    /// `window_leakage_envelope_matches_the_real_transform`.
+    fn leakage_shape(&self) -> (f64, f64, f64, f64) {
+        match self {
+            //                          lobe  plateau  ends  roll-off
+            FftWindow::Hanning => (2.0, 31.5, 3.0, 17.3),
+            FftWindow::Hamming => (2.0, 42.7, 5.0, 3.5),
+            FftWindow::BlackmanHarris => (5.0, 92.0, 6.0, 3.0),
+            FftWindow::FlatTop => (6.0, 93.5, 7.0, 0.0),
+            FftWindow::Rectangular => (1.0, 13.3, 2.0, 6.0),
+        }
+    }
+
+    /// How far below a tone's peak this window's leakage sits, `bins` RBW bins away from it.
+    ///
+    /// Returns 0 inside the main lobe — nothing there is separable from the tone itself. Used
+    /// to tell a real second signal from the first one's own sidelobes, which zero-padded
+    /// display traces resolve as genuine local maxima.
+    pub fn leakage_envelope_db(&self, bins: f64) -> f64 {
+        let (lobe, plateau_db, plateau_to, rolloff) = self.leakage_shape();
+        let bins = bins.abs();
+        if bins <= lobe {
+            return 0.0;
+        }
+        if bins <= plateau_to {
+            return plateau_db;
+        }
+        plateau_db + rolloff * (bins / plateau_to).log2()
     }
 }
 
@@ -380,6 +423,7 @@ pub fn process_adc_block(
     tile: &AdcTile,
     raw_source_samples: Option<&[Complex<f64>]>,
     rf_chain_response: Option<(Vec<f64>, Vec<f64>)>,
+    display_window: FftWindow,
 ) -> ProcessedSignal {
     let fft_size = ANALYSIS_FFT_SIZE;
     let fs_mhz = tile.sample_rate_mhz();
@@ -404,14 +448,28 @@ pub fn process_adc_block(
         apply_analog_bandwidth(&dsa_samples, input_sample_rate_mhz, &block.analog_front_end);
     let analog_samples = apply_analog_non_idealities(&afe_samples, &block.non_idealities);
 
+    // Every spectrum below is drawn, not measured, so each is interpolated up to
+    // DISPLAY_FFT_SIZE points. See `display_pad_factor` for why the raw bins are not enough.
+    let analysis_pad = display_pad_factor(fft_size);
+
     // 2. Input spectrum (full wideband) — the real voltage at the ADC pin
-    let (input_spectrum, input_freq) =
-        compute_spectrum_positive(&analog_samples, fft_size, input_sample_rate_mhz);
+    let (input_spectrum, input_freq) = compute_spectrum_positive_padded(
+        &analog_samples,
+        fft_size,
+        input_sample_rate_mhz,
+        display_window,
+        analysis_pad,
+    );
 
     let raw_source_spectrum_dbfs = raw_source_samples.map(|samples| {
         let real_source = physical_voltage(samples);
-        let (raw_spec, _) =
-            compute_spectrum_positive(&real_source, fft_size, input_sample_rate_mhz);
+        let (raw_spec, _) = compute_spectrum_positive_padded(
+            &real_source,
+            fft_size,
+            input_sample_rate_mhz,
+            display_window,
+            analysis_pad,
+        );
         raw_spec
     });
 
@@ -424,7 +482,7 @@ pub fn process_adc_block(
 
     // Folded spectrum: actual ADC digital output spectrum (0..Fs/2)
     let (folded_spectrum, folded_freq) =
-        compute_spectrum_positive(&tile_samples, fft_size, fs_mhz);
+        compute_spectrum_positive_padded(&tile_samples, fft_size, fs_mhz, display_window, analysis_pad);
 
     let nco_freq = resolve_nco_freq(ms.freq, fs_mhz, block.nyquist_zone.is_even());
 
@@ -453,9 +511,9 @@ pub fn process_adc_block(
     // 4. Compute post-mixer spectrum (at ADC tile rate Fs)
     let complex_output = block.produces_complex_output();
     let (post_mixer_spectrum, post_mixer_freq) = if complex_output {
-        compute_spectrum(&mixed_samples, fft_size, fs_mhz)
+        compute_spectrum_padded(&mixed_samples, fft_size, fs_mhz, display_window, analysis_pad)
     } else {
-        compute_spectrum_positive(&mixed_samples, fft_size, fs_mhz)
+        compute_spectrum_positive_padded(&mixed_samples, fft_size, fs_mhz, display_window, analysis_pad)
     };
 
     // The decimation filter's window onto the post-mixer spectrum: everything outside it is
@@ -480,10 +538,18 @@ pub fn process_adc_block(
 
     // 6. Output spectrum
     let out_fft = output_fft_size(decim_factor);
-    let (output_spectrum, output_freq) = if complex_output {
-        compute_spectrum(&decimated, out_fft, actual_output_rate)
+    // Samples the output transform actually sees, matching what compute_spectrum_* will use.
+    let out_analysed = (out_fft.min(decimated.len()) / 2) * 2;
+    let out_pad = display_pad_factor(out_analysed);
+    let output_rbw_mhz = if out_analysed > 0 {
+        actual_output_rate / out_analysed as f64
     } else {
-        compute_spectrum_positive(&decimated, out_fft, actual_output_rate)
+        0.0
+    };
+    let (output_spectrum, output_freq) = if complex_output {
+        compute_spectrum_padded(&decimated, out_fft, actual_output_rate, display_window, out_pad)
+    } else {
+        compute_spectrum_positive_padded(&decimated, out_fft, actual_output_rate, display_window, out_pad)
     };
 
     let (rf_chain_response_db, rf_chain_freq_axis_mhz) = match rf_chain_response {
@@ -507,34 +573,58 @@ pub fn process_adc_block(
         output_spectrum_dbfs: output_spectrum,
         output_freq_axis_mhz: output_freq,
         output_sample_rate_mhz: actual_output_rate,
+        display_window,
+        output_rbw_mhz,
         output_time_samples: decimated,
         overrange,
     }
 }
 
+/// Window `n` samples and zero-pad the result out to `n * pad` before transforming.
+///
+/// Padding buys no resolution — the resolution bandwidth is still set by the `n` samples that
+/// actually carry signal — but it samples the window's transfer function densely enough to
+/// draw. Without it a bin-centred tone lands on exactly the three non-zero bins of a Hanning
+/// main lobe and every trace shows it as a hairline spike with vertical sides, while the same
+/// tone half a bin away smears into a broad skirt. See `display_pad_factor`.
+fn windowed_padded_fft(
+    samples: &[Complex<f64>],
+    n: usize,
+    window: FftWindow,
+    pad: usize,
+) -> Vec<Complex<f64>> {
+    let mut buffer: Vec<Complex<f64>> = samples[..n].to_vec();
+    window.apply(&mut buffer);
+    // Pad after windowing: windowing the zeros would taper them into the real samples.
+    buffer.resize(n * pad.max(1), Complex::new(0.0, 0.0));
+    let len = buffer.len();
+    FFT_PLANNER.with(|planner| {
+        let fft = planner.borrow_mut().plan_fft_forward(len);
+        fft.process(&mut buffer);
+    });
+    buffer
+}
+
 /// Compute the power spectrum of complex samples using FFT with a specific window function.
-pub fn compute_spectrum_with_window(
+///
+/// `pad` zero-pads the transform to `pad`× the analysed length, interpolating the trace for
+/// display without changing the resolution bandwidth. Use 1 for a plain analysis FFT.
+pub fn compute_spectrum_padded(
     samples: &[Complex<f64>],
     fft_size: usize,
     sample_rate_mhz: f64,
     window: FftWindow,
+    pad: usize,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = (fft_size.min(samples.len()) / 2) * 2;
     if n == 0 {
         return (Vec::new(), Vec::new());
     }
-    let mut buffer: Vec<Complex<f64>> = samples[..n].to_vec();
+    let buffer = windowed_padded_fft(samples, n, window, pad);
+    let len = buffer.len();
 
-    // Apply selected window function
-    window.apply(&mut buffer);
-
-    // Process FFT using thread-local planner cache
-    FFT_PLANNER.with(|planner| {
-        let fft = planner.borrow_mut().plan_fft_forward(n);
-        fft.process(&mut buffer);
-    });
-
-    // Compute magnitude in dBFS (normalised to FFT size and window coherent gain)
+    // Compute magnitude in dBFS. Normalisation uses the *analysed* length `n`, not the padded
+    // length — the padding contributes no energy, so scaling by it would under-read every bin.
     let norm = 1.0 / (n as f64 * window.coherent_gain());
     let spectrum_dbfs: Vec<f64> = buffer
         .iter()
@@ -545,17 +635,27 @@ pub fn compute_spectrum_with_window(
         .collect();
 
     // FFT-shift: move DC to centre
-    let mut shifted = vec![0.0; n];
-    let half = n / 2;
+    let mut shifted = vec![0.0; len];
+    let half = len / 2;
     shifted[..half].copy_from_slice(&spectrum_dbfs[half..]);
     shifted[half..].copy_from_slice(&spectrum_dbfs[..half]);
 
     // Frequency axis (centred)
-    let freq_axis: Vec<f64> = (0..n)
-        .map(|i| (i as f64 - half as f64) * sample_rate_mhz / n as f64)
+    let freq_axis: Vec<f64> = (0..len)
+        .map(|i| (i as f64 - half as f64) * sample_rate_mhz / len as f64)
         .collect();
 
     (shifted, freq_axis)
+}
+
+/// Compute the power spectrum of complex samples using FFT with a specific window function.
+pub fn compute_spectrum_with_window(
+    samples: &[Complex<f64>],
+    fft_size: usize,
+    sample_rate_mhz: f64,
+    window: FftWindow,
+) -> (Vec<f64>, Vec<f64>) {
+    compute_spectrum_padded(samples, fft_size, sample_rate_mhz, window, 1)
 }
 
 /// Compute the power spectrum of complex samples using FFT (default Hanning window).
@@ -567,29 +667,25 @@ pub fn compute_spectrum(
     compute_spectrum_with_window(samples, fft_size, sample_rate_mhz, FftWindow::Hanning)
 }
 
-/// Compute single-sided (positive frequency only) power spectrum with a specific window function.
-pub fn compute_spectrum_positive_with_window(
+/// Single-sided (positive frequency only) power spectrum, zero-padded by `pad`.
+///
+/// See [`compute_spectrum_padded`] for what padding does and does not buy.
+pub fn compute_spectrum_positive_padded(
     samples: &[Complex<f64>],
     fft_size: usize,
     sample_rate_mhz: f64,
     window: FftWindow,
+    pad: usize,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = (fft_size.min(samples.len()) / 2) * 2;
     if n == 0 {
         return (Vec::new(), Vec::new());
     }
-    let mut buffer: Vec<Complex<f64>> = samples[..n].to_vec();
-
-    // Apply selected window function
-    window.apply(&mut buffer);
-
-    FFT_PLANNER.with(|planner| {
-        let fft = planner.borrow_mut().plan_fft_forward(n);
-        fft.process(&mut buffer);
-    });
+    let buffer = windowed_padded_fft(samples, n, window, pad);
+    let len = buffer.len();
 
     let norm = 1.0 / (n as f64 * window.coherent_gain());
-    let half = n / 2;
+    let half = len / 2;
 
     // Take only positive frequencies (0..Fs/2)
     let spectrum_dbfs: Vec<f64> = buffer[..=half]
@@ -606,10 +702,20 @@ pub fn compute_spectrum_positive_with_window(
         .collect();
 
     let freq_axis: Vec<f64> = (0..=half)
-        .map(|i| i as f64 * sample_rate_mhz / n as f64)
+        .map(|i| i as f64 * sample_rate_mhz / len as f64)
         .collect();
 
     (spectrum_dbfs, freq_axis)
+}
+
+/// Compute single-sided (positive frequency only) power spectrum with a specific window function.
+pub fn compute_spectrum_positive_with_window(
+    samples: &[Complex<f64>],
+    fft_size: usize,
+    sample_rate_mhz: f64,
+    window: FftWindow,
+) -> (Vec<f64>, Vec<f64>) {
+    compute_spectrum_positive_padded(samples, fft_size, sample_rate_mhz, window, 1)
 }
 
 /// Compute single-sided (positive frequency only) power spectrum (default Hanning window).
@@ -999,8 +1105,45 @@ impl DecimationChain {
 pub const ANALYSIS_FFT_SIZE: usize = 2048;
 
 /// FFT length used for the DDC output spectrum at a given decimation factor.
+///
+/// The decimator only emits `ANALYSIS_FFT_SIZE / decimation` samples, so this is the real
+/// resolution bandwidth of the output pane and it coarsens with decimation — at ×40 the floor
+/// leaves 64 bins across the whole output span. Raising the floor means generating
+/// proportionally more wideband input (see `required_tile_samples`), which at ×40 costs more
+/// per frame than the rest of the pipeline put together, so it stays here.
+///
+/// This is resolution, not drawability: `DISPLAY_FFT_SIZE` separately interpolates whatever
+/// this yields up to a point count that can be drawn without collapsing to a hairline.
 pub fn output_fft_size(decimation: u32) -> usize {
     (ANALYSIS_FFT_SIZE / decimation.max(1) as usize).max(64)
+}
+
+/// Point count every spectrum is interpolated up to before it reaches a plot.
+///
+/// A windowed FFT of `N` samples resolves a CW tone into a main lobe only a few bins wide —
+/// three, for Hanning on a bin-centred tone. Drawn straight, that is a hairline spike with
+/// vertical sides, and it moves under the tone by a full bin at a time. Zero-padding to a
+/// fixed point count samples the same main lobe finely enough that the trace shows its real
+/// shape and the peak reads its true amplitude regardless of where the tone falls.
+pub const DISPLAY_FFT_SIZE: usize = 4096;
+
+/// Window the display starts on. Blackman-Harris rather than the usual Hanning: its sidelobes
+/// are 60 dB lower, which keeps a CW tone's leakage skirt off the trace entirely, and it costs
+/// only ~36% in -3 dB main-lobe width. Selectable per-view; see `FftWindow::ALL`.
+pub const DEFAULT_DISPLAY_WINDOW: FftWindow = FftWindow::BlackmanHarris;
+
+/// Zero-pad factor that lifts an `n`-point transform to at least [`DISPLAY_FFT_SIZE`] points.
+///
+/// Powers of two only, so the padded length stays on rustfft's radix-2 path.
+pub fn display_pad_factor(n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut pad = 1;
+    while n * pad < DISPLAY_FFT_SIZE {
+        pad *= 2;
+    }
+    pad
 }
 
 /// Round `n` up to the next 5-smooth number (only factors of 2, 3 and 5).
@@ -1360,25 +1503,34 @@ mod tests {
 
         let sim_fs = 10000.0;
         let input_samples = sig_gen.generate(1024, sim_fs);
-        let processed = process_adc_block(&input_samples, sim_fs, &block, &tile, Some(&input_samples), None);
+        let processed = process_adc_block(&input_samples, sim_fs, &block, &tile, Some(&input_samples), None, DEFAULT_DISPLAY_WINDOW);
 
         // Find peak in output spectrum
         let peaks = crate::ui::spectrum_view::find_spectral_peaks(
             &processed.output_spectrum_dbfs,
             &processed.output_freq_axis_mhz,
             -20.0,
+            processed.output_rbw_mhz,
+            processed.display_window,
         );
 
         assert!(!peaks.is_empty(), "Should detect peak near 0 Hz baseband");
+        // At ×1 there is no decimation filter, so the R2C mixer's negative image survives at
+        // -2·f_baseband at the same level as the wanted tone. Which of the two tops the
+        // magnitude-sorted list is a coin flip, so ask for the one at DC by frequency.
+        let dc_peak = peaks
+            .iter()
+            .find(|pk| pk.freq_mhz.abs() < 10.0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Auto-tuned 2400 MHz tone in Zone 3 should land at 0 Hz baseband, strongest peak was {:.1} MHz",
+                    peaks[0].freq_mhz
+                )
+            });
         assert!(
-            peaks[0].freq_mhz.abs() < 10.0,
-            "Auto-tuned 2400 MHz tone in Zone 3 should land at 0 Hz baseband, got {:.1} MHz",
-            peaks[0].freq_mhz
-        );
-        assert!(
-            (peaks[0].mag_dbfs - (-12.0)).abs() < 3.0,
+            (dc_peak.mag_dbfs - (-12.0)).abs() < 3.0,
             "Peak magnitude should be close to -12 dBFS due to 6 dB drop from real-to-complex quadrature mixing, got {:.1} dBFS",
-            peaks[0].mag_dbfs
+            dc_peak.mag_dbfs
         );
     }
 
@@ -1418,12 +1570,14 @@ mod tests {
 
         let sim_fs = 15000.0;
         let input_samples = sig_gen.generate(1024, sim_fs);
-        let processed = process_adc_block(&input_samples, sim_fs, &tile.blocks[0], &tile, None, None);
+        let processed = process_adc_block(&input_samples, sim_fs, &tile.blocks[0], &tile, None, None, DEFAULT_DISPLAY_WINDOW);
 
         let peaks = crate::ui::spectrum_view::find_spectral_peaks(
             &processed.output_spectrum_dbfs,
             &processed.output_freq_axis_mhz,
             -20.0,
+            processed.output_rbw_mhz,
+            processed.display_window,
         );
 
         assert!(!peaks.is_empty());
@@ -1454,12 +1608,14 @@ mod tests {
 
         let sim_fs = 15000.0;
         let input = sig_gen.generate(16384, sim_fs);
-        let processed = process_adc_block(&input, sim_fs, &block, &tile, None, None);
+        let processed = process_adc_block(&input, sim_fs, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
 
         let peaks = crate::ui::spectrum_view::find_spectral_peaks(
             &processed.output_spectrum_dbfs,
             &processed.output_freq_axis_mhz,
             -200.0,
+            processed.output_rbw_mhz,
+            processed.display_window,
         );
         assert!(!peaks.is_empty());
 
@@ -1508,7 +1664,7 @@ mod tests {
             sig_gen.noise_enabled = false;
 
             let input = sig_gen.generate(8192, 15000.0);
-            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None);
+            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
 
             let peak_of = |s: &[f64]| s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let pre = peak_of(&processed.input_spectrum_dbfs);
@@ -1544,7 +1700,7 @@ mod tests {
             }];
             sig_gen.noise_enabled = false;
             let input = sig_gen.generate(8192, 15000.0);
-            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None);
+            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
             processed
                 .folded_spectrum_dbfs
                 .iter()
@@ -1729,11 +1885,13 @@ mod tests {
             }];
             sig_gen.noise_enabled = false;
             let input = sig_gen.generate(16384, 15000.0);
-            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None);
+            let processed = process_adc_block(&input, 15000.0, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
             let peaks = crate::ui::spectrum_view::find_spectral_peaks(
                 &processed.output_spectrum_dbfs,
                 &processed.output_freq_axis_mhz,
                 -60.0,
+                processed.output_rbw_mhz,
+                processed.display_window,
             );
             assert!(!peaks.is_empty(), "no peak found for {rf_mhz} MHz");
             peaks[0].freq_mhz
@@ -1918,12 +2076,12 @@ mod tests {
             })
             .collect();
 
-        let processed = process_adc_block(&samples, 15000.0, &block, &tile, None, None);
+        let processed = process_adc_block(&samples, 15000.0, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
 
         // With DSA, the output peak should be ~6 dB lower than without DSA
         let mut block_no_dsa = block.clone();
         block_no_dsa.dsa_db = 0.0;
-        let processed_no_dsa = process_adc_block(&samples, 15000.0, &block_no_dsa, &tile, None, None);
+        let processed_no_dsa = process_adc_block(&samples, 15000.0, &block_no_dsa, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
 
         let peak_with_dsa = processed.folded_spectrum_dbfs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let peak_no_dsa = processed_no_dsa.folded_spectrum_dbfs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -2029,4 +2187,242 @@ mod tests {
             peak_pos_dbfs
         );
     }
+
+    /// A bin-centred CW tone puts all its energy in the three non-zero bins of a Hanning main
+    /// lobe. Drawn straight, that is a hairline spike with vertical sides — what the display
+    /// looked like before the trace was interpolated. Padding has to sample the same lobe
+    /// densely enough to draw its actual shape.
+    #[test]
+    fn display_padding_resolves_the_main_lobe_of_a_bin_centred_tone() {
+        let n = 256;
+        let fs = 500.0;
+        // Exactly on bin 0 of the shifted spectrum: the worst case for a raw FFT trace.
+        let samples: Vec<Complex<f64>> = (0..n).map(|_| Complex::new(0.5, 0.0)).collect();
+
+        let (raw, _) = compute_spectrum_padded(&samples, n, fs, FftWindow::Hanning, 1);
+        let (padded, _) = compute_spectrum_padded(&samples, n, fs, FftWindow::Hanning, 16);
+
+        let peak = |s: &[f64]| s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        // Count points within 20 dB of the peak — the visible width of the drawn lobe.
+        let lobe = |s: &[f64]| {
+            let p = peak(s);
+            s.iter().filter(|&&v| v > p - 20.0).count()
+        };
+
+        assert_eq!(
+            lobe(&raw),
+            3,
+            "raw trace should show the classic 3-bin Hanning lobe"
+        );
+        assert!(
+            lobe(&padded) >= 24,
+            "padded trace should sample the same lobe with many points, got {}",
+            lobe(&padded)
+        );
+        // Padding must not change the level: it adds no energy.
+        assert!(
+            (peak(&padded) - peak(&raw)).abs() < 0.01,
+            "padding changed the peak level: {:.3} vs {:.3} dBFS",
+            peak(&padded),
+            peak(&raw)
+        );
+    }
+
+    /// The flip side of the hairline spike: a tone landing between bins reads low and smears.
+    /// Padding removes the scalloping error, so the peak marker reports the same level
+    /// wherever the tone falls.
+    #[test]
+    fn display_padding_removes_scalloping_loss() {
+        let n = 256;
+        let fs = 500.0;
+        let bin = fs / n as f64;
+
+        let tone = |f_mhz: f64| -> Vec<Complex<f64>> {
+            (0..n)
+                .map(|i| {
+                    let a = 2.0 * PI * f_mhz * i as f64 / fs;
+                    Complex::new(0.5 * a.cos(), 0.5 * a.sin())
+                })
+                .collect()
+        };
+        let peak = |s: &[f64]| s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        let on_bin = peak(&compute_spectrum_padded(&tone(10.0 * bin), n, fs, FftWindow::Hanning, 16).0);
+        let half_bin = peak(&compute_spectrum_padded(&tone(10.5 * bin), n, fs, FftWindow::Hanning, 16).0);
+        let raw_half_bin = peak(&compute_spectrum_padded(&tone(10.5 * bin), n, fs, FftWindow::Hanning, 1).0);
+
+        assert!(
+            (on_bin - half_bin).abs() < 0.1,
+            "padded peak should not depend on bin alignment: {:.2} vs {:.2} dBFS",
+            on_bin,
+            half_bin
+        );
+        // Hanning scallops by ~1.4 dB at the half-bin worst case without padding.
+        assert!(
+            on_bin - raw_half_bin > 1.0,
+            "expected the unpadded half-bin tone to read low, got {:.2} dB of loss",
+            on_bin - raw_half_bin
+        );
+    }
+
+    /// Every spectrum handed to the UI should arrive with enough points to draw, whatever the
+    /// decimation does to the native transform length.
+    #[test]
+    fn every_display_spectrum_reaches_the_display_point_count() {
+        use crate::rfdc::{AdcTile, DecimationFactor, MixerMode, MixerType};
+        use crate::signal::{SignalGenerator, Tone, ToneModulation};
+
+        for decim in DecimationFactor::ALL {
+            let sim_fs = 15000.0;
+            let mut tile = AdcTile::new(0);
+            tile.sample_rate_gsps = 4.0;
+            {
+                let b = &mut tile.blocks[0];
+                b.decimation = decim;
+                b.mixer_settings.mixer_type = MixerType::Fine;
+                b.mixer_settings.mixer_mode = MixerMode::RealToIq;
+                b.mixer_settings.freq = -300.0;
+            }
+            let block = tile.blocks[0].clone();
+
+            let oversampling = sim_fs / tile.sample_rate_mhz();
+            let needed = required_tile_samples(decim.factor());
+            let num = next_smooth_size(
+                ((needed as f64 * oversampling).ceil() as usize).clamp(4096, 131_072),
+            );
+
+            let sig_gen = SignalGenerator {
+                tones: vec![Tone {
+                    frequency_mhz: 300.0,
+                    amplitude_dbfs: -6.0,
+                    phase_deg: 0.0,
+                    bandwidth_mhz: 0.0,
+                    modulation: ToneModulation::Cw,
+                }],
+                noise_floor_dbfs: -80.0,
+                noise_enabled: true,
+            };
+            let samples = sig_gen.generate(num, sim_fs);
+            let out = process_adc_block(&samples, sim_fs, &block, &tile, None, None, DEFAULT_DISPLAY_WINDOW);
+
+            // One-sided spectra land on DISPLAY_FFT_SIZE/2 + 1 points, two-sided on the full count.
+            let floor = DISPLAY_FFT_SIZE / 2;
+            for (name, len) in [
+                ("input", out.input_spectrum_dbfs.len()),
+                ("folded", out.folded_spectrum_dbfs.len()),
+                ("post-mixer", out.post_mixer_spectrum_dbfs.len()),
+                ("output", out.output_spectrum_dbfs.len()),
+            ] {
+                assert!(
+                    len >= floor,
+                    "{name} spectrum at ×{} has only {len} points",
+                    decim.factor()
+                );
+            }
+        }
+    }
+
+
+
+
+    /// The leakage envelope drives peak picking, so it has to bound the window's real
+    /// sidelobes rather than just quote a datasheet. Measures each window's own transform.
+    #[test]
+    fn window_leakage_envelope_matches_the_real_transform() {
+        let n = 512;
+        for window in FftWindow::ALL {
+            // A DC tone: the transform of the window itself.
+            let ones: Vec<Complex<f64>> = (0..n).map(|_| Complex::new(1.0, 0.0)).collect();
+            let (spec, freq) = compute_spectrum_padded(&ones, n, 1.0, window, 16);
+            let peak = spec.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let bin = 1.0 / n as f64;
+
+            let mut worst_excess: f64 = f64::NEG_INFINITY;
+            let mut worst_at = 0.0;
+            for (i, &f) in freq.iter().enumerate() {
+                let bins = f.abs() / bin;
+                // Beyond the main lobe, and short of the floor where rounding dominates.
+                if !(2.0..=64.0).contains(&bins) || spec[i] < peak - 160.0 {
+                    continue;
+                }
+                let predicted = peak - window.leakage_envelope_db(bins);
+                if spec[i] - predicted > worst_excess {
+                    worst_excess = spec[i] - predicted;
+                    worst_at = bins;
+                }
+            }
+            assert!(
+                worst_excess < 3.0,
+                "{window} sidelobes rise {worst_excess:.1} dB above the modelled envelope at \
+                 {worst_at:.1} bins; the model must bound them from below"
+            );
+        }
+    }
+
+
+    /// The window is a display choice the user makes, so the pipeline has to actually use the
+    /// one it is handed — every spectrum, not just some.
+    #[test]
+    fn pipeline_honours_the_selected_display_window() {
+        use crate::rfdc::{AdcTile, DecimationFactor, MixerMode, MixerType};
+        use crate::signal::{SignalGenerator, Tone, ToneModulation};
+
+        let sim_fs = 15000.0;
+        let mut tile = AdcTile::new(0);
+        tile.sample_rate_gsps = 4.0;
+        {
+            let b = &mut tile.blocks[0];
+            b.decimation = DecimationFactor::X8;
+            b.mixer_settings.mixer_type = MixerType::Fine;
+            b.mixer_settings.mixer_mode = MixerMode::RealToIq;
+            b.mixer_settings.freq = -250.0;
+        }
+        let block = tile.blocks[0].clone();
+        let oversampling = sim_fs / tile.sample_rate_mhz();
+        let num = next_smooth_size(
+            ((required_tile_samples(8) as f64 * oversampling).ceil() as usize).clamp(4096, 131_072),
+        );
+        let sig_gen = SignalGenerator {
+            tones: vec![Tone {
+                frequency_mhz: 300.0,
+                amplitude_dbfs: -6.0,
+                phase_deg: 0.0,
+                bandwidth_mhz: 0.0,
+                modulation: ToneModulation::Cw,
+            }],
+            noise_floor_dbfs: -80.0,
+            noise_enabled: false,
+        };
+        let samples = sig_gen.generate(num, sim_fs);
+
+        // Worst leakage well outside either window's main lobe.
+        let skirt_db = |w: FftWindow| {
+            let out = process_adc_block(&samples, sim_fs, &block, &tile, None, None, w);
+            let spec = &out.output_spectrum_dbfs;
+            let freq = &out.output_freq_axis_mhz;
+            let peak = spec.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let pk_f = freq[spec.iter().position(|&v| v == peak).unwrap()];
+            let mut worst = f64::NEG_INFINITY;
+            for (i, &f) in freq.iter().enumerate() {
+                if (f - pk_f).abs() / out.output_rbw_mhz > 12.0 {
+                    worst = worst.max(spec[i]);
+                }
+            }
+            (peak, peak - worst)
+        };
+
+        let (han_peak, han_skirt) = skirt_db(FftWindow::Hanning);
+        let (bh_peak, bh_skirt) = skirt_db(FftWindow::BlackmanHarris);
+
+        // Both must read the tone at the same level — the window changes leakage, not amplitude.
+        assert!(
+            (han_peak - bh_peak).abs() < 0.5,
+            "window changed the reported tone level: {han_peak:.2} vs {bh_peak:.2} dBFS"
+        );
+        assert!(
+            bh_skirt > han_skirt + 20.0,
+            "Blackman-Harris should push the leakage skirt far below Hanning's; got {bh_skirt:.1} vs {han_skirt:.1} dB"
+        );
+    }
 }
+

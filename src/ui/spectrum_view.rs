@@ -1,10 +1,22 @@
 //! Spectrum visualization plots using egui_plot and waterfall spectrogram.
 
-use crate::dsp::ProcessedSignal;
+use crate::dsp::{FftWindow, ProcessedSignal};
 use crate::ui::theme::Theme;
 use egui_plot::{Line, Plot, PlotPoints};
 use std::cell::RefCell;
 use std::collections::VecDeque;
+
+/// Left margin every stacked plot reserves for its y axis.
+///
+/// `link_axis` synchronises the data range, not the geometry: two plots showing the same range
+/// on plot areas of different width put the same frequency at different screen x, so the
+/// waterfall drifts out of register with the spectrum above it. Pinning the axis width on both
+/// keeps their plot areas identical. Wide enough for "-150" plus padding.
+const PLOT_Y_AXIS_WIDTH: f32 = 56.0;
+
+/// Widest waterfall texture built per frame. Beyond this the extra columns land inside a
+/// pixel anyway, and the upload cost is paid every frame.
+const WATERFALL_MAX_COLUMNS: usize = 1024;
 
 struct WaterfallState {
     paused: bool,
@@ -34,11 +46,28 @@ pub struct SpectralPeak {
     pub mag_dbfs: f64,
 }
 
-/// Find local spectral peaks above threshold_dbfs.
+/// Margin a candidate must clear above a stronger peak's leakage to count as its own signal.
+/// The measured envelope tracks theory to a few hundredths of a dB, so this only has to cover
+/// noise jitter on the trace.
+const LEAKAGE_MARGIN_DB: f64 = 3.0;
+
+/// Find local spectral peaks above threshold_dbfs, strongest first.
+///
+/// Display traces are zero-padded, which resolves the analysis window's sidelobes into genuine
+/// local maxima — a single tone produces dozens. `rbw_mhz` (the pane's real resolution
+/// bandwidth, not its point spacing) lets this drop any candidate buried under a stronger
+/// peak's leakage, so what comes back is signals rather than one signal's skirt.
+///
+/// A real tone sitting below the leakage envelope of a stronger neighbour is dropped too. That
+/// is honest: at that separation and level it is not distinguishable from leakage.
+///
+/// Pass 0 for `rbw_mhz` to get the raw local maxima.
 pub fn find_spectral_peaks(
     spectrum: &[f64],
     freq_axis: &[f64],
     threshold_dbfs: f64,
+    rbw_mhz: f64,
+    window: FftWindow,
 ) -> Vec<SpectralPeak> {
     let mut peaks = Vec::new();
     if spectrum.len() < 3 || spectrum.len() != freq_axis.len() {
@@ -56,15 +85,46 @@ pub fn find_spectral_peaks(
         }
     }
     peaks.sort_by(|a, b| b.mag_dbfs.partial_cmp(&a.mag_dbfs).unwrap_or(std::cmp::Ordering::Equal));
-    peaks
+
+    if rbw_mhz <= 0.0 {
+        return peaks;
+    }
+    // Strongest first, so every candidate is tested against the peaks that could bury it.
+    let mut kept: Vec<SpectralPeak> = Vec::new();
+    for pk in peaks {
+        // Leakage from several tones lands on the same bin and adds, so sum it in power
+        // rather than testing each stronger peak on its own — one skirt may not reach the
+        // candidate while two together do.
+        let leakage_power: f64 = kept
+            .iter()
+            .map(|k| {
+                let bins = (k.freq_mhz - pk.freq_mhz).abs() / rbw_mhz;
+                let db = k.mag_dbfs - window.leakage_envelope_db(bins);
+                10.0_f64.powf(db / 10.0)
+            })
+            .sum();
+        if leakage_power <= 0.0 {
+            kept.push(pk);
+            continue;
+        }
+        let leakage_dbfs = 10.0 * leakage_power.log10();
+        if pk.mag_dbfs >= leakage_dbfs + LEAKAGE_MARGIN_DB {
+            kept.push(pk);
+        }
+    }
+    kept
 }
 
 /// Render the multi-pane spectrum display with waterfall and peak markers.
+/// Renders the spectrum panes. Returns true if the user changed the analysis window, so the
+/// caller can recompute even with auto-compute off.
 pub fn show_spectrum_view(
     ui: &mut egui::Ui,
     processed: &Option<ProcessedSignal>,
     tile_fs_mhz: f64,
-) {
+    display_window: &mut FftWindow,
+) -> bool {
+    let mut window_changed = false;
     if let Some(signal) = processed {
         let available_height = ui.available_height();
         let plot_height = (available_height / 3.2).max(140.0);
@@ -79,6 +139,27 @@ pub fn show_spectrum_view(
                 ui.separator();
                 ui.colored_label(Theme::ACCENT_ERROR, "⚠ OVR");
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let before = *display_window;
+                egui::ComboBox::from_id_salt("fft_window")
+                    .selected_text(display_window.to_string())
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for w in FftWindow::ALL {
+                            ui.selectable_value(display_window, w, w.to_string())
+                                .on_hover_text(window_hint(w));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Trades main-lobe width against how far a tone's leakage skirt spreads. \
+                         Low sidelobes reveal weak signals beside a strong one; a narrow lobe \
+                         separates two close ones.",
+                    );
+                ui.label(egui::RichText::new("FFT window:").color(Theme::TEXT_SECONDARY));
+                window_changed = *display_window != before;
+            });
         });
         ui.separator();
 
@@ -219,6 +300,8 @@ pub fn show_spectrum_view(
                 two_sided: signal.complex_output,
                 show_dc_marker: signal.complex_output,
                 show_peak_markers: true,
+                window: signal.display_window,
+                resolution_bw_mhz: signal.output_rbw_mhz,
                 usable_band_mhz: Some(
                     crate::dsp::DDC_PASSBAND_FRAC * signal.output_sample_rate_mhz,
                 ),
@@ -350,134 +433,165 @@ pub fn show_spectrum_view(
                     history.push_front(signal.output_spectrum_dbfs.clone());
                 }
 
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("🌊 Real-Time Spectrogram / Waterfall Plot")
-                                .strong()
-                                .size(13.0)
-                                .color(Theme::ACCENT_PRIMARY),
-                        );
-                        ui.colored_label(
-                            Theme::TEXT_SECONDARY,
-                            "(Vertical: Time [latest on top], Horizontal: Frequency, Color: dBFS intensity)",
-                        );
+                // Deliberately not wrapped in ui.group: the group inset would shift this
+                // pane a few pixels relative to the spectrum panes above, and a linked x
+                // axis only matches ranges, not screen geometry.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("🌊 Real-Time Spectrogram / Waterfall Plot")
+                            .strong()
+                            .size(13.0)
+                            .color(Theme::ACCENT_PRIMARY),
+                    );
+                    ui.colored_label(
+                        Theme::TEXT_SECONDARY,
+                        "(Vertical: Time [latest on top], Horizontal: Frequency, Color: dBFS intensity)",
+                    );
 
-                        // Controls
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("🗑 Clear").clicked() {
-                                history.clear();
-                            }
-                            if ui.button(if state.paused { "▶ Resume" } else { "⏸ Freeze" }).clicked() {
-                                state.paused = !state.paused;
-                            }
-                            
-                            ui.add(egui::Slider::new(&mut state.max_db, -150.0..=20.0).text("Max dB"));
-                            ui.add(egui::Slider::new(&mut state.min_db, -150.0..=20.0).text("Min dB"));
-                            
-                            // Colorbar Legend
-                            let mut legend_pixels = Vec::with_capacity(60 * 10);
-                            for _y in 0..10 {
-                                for x in 0..60 {
-                                    let norm = x as f64 / 59.0;
-                                    let r = (norm * 3.0 - 1.0).clamp(0.0, 1.0);
-                                    let g = (norm * 3.0 - 2.0).clamp(0.0, 1.0);
-                                    let b = (norm * 3.0).clamp(0.0, 1.0) - (norm * 3.0 - 1.0).clamp(0.0, 1.0);
-                                    legend_pixels.push(egui::Color32::from_rgb(
-                                        (r * 255.0) as u8,
-                                        (g * 255.0) as u8,
-                                        (b * 255.0) as u8,
-                                    ));
-                                }
-                            }
-                            let legend_img = egui::ColorImage::new([60, 10], legend_pixels);
-                            let legend_tex = ui.ctx().load_texture("waterfall_legend", legend_img, egui::TextureOptions::LINEAR);
-                            ui.add(egui::Image::new(&legend_tex).fit_to_exact_size(egui::vec2(60.0, 10.0)));
-                            ui.label(egui::RichText::new("Legend:").color(Theme::TEXT_SECONDARY));
-                        });
-                    });
-
-                    let width = new_len;
-                    let height = history.len();
-                    if width > 0 && height > 0 {
-                        let mut pixels = Vec::with_capacity(width * height);
-                        let range_db = (state.max_db - state.min_db).max(0.1);
-
-                        for row in history.iter() {
-                            if row.len() == width {
-                                for &mag in row.iter() {
-                                    // Map dBFS using dynamic range
-                                    let norm = ((mag - state.min_db) / range_db).clamp(0.0, 1.0);
-                                    
-                                    // Magma/Inferno style colormap: Black -> Blue -> Purple -> Red -> Yellow
-                                    let r = (norm * 3.0 - 1.0).clamp(0.0, 1.0);
-                                    let g = (norm * 3.0 - 2.0).clamp(0.0, 1.0);
-                                    let b = (norm * 3.0).clamp(0.0, 1.0) - (norm * 3.0 - 1.0).clamp(0.0, 1.0);
-
-                                    pixels.push(egui::Color32::from_rgb(
-                                        (r * 255.0) as u8,
-                                        (g * 255.0) as u8,
-                                        (b * 255.0) as u8,
-                                    ));
-                                }
+                    // Controls
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("🗑 Clear").clicked() {
+                            history.clear();
+                        }
+                        if ui.button(if state.paused { "▶ Resume" } else { "⏸ Freeze" }).clicked() {
+                            state.paused = !state.paused;
+                        }
+                        
+                        ui.add(egui::Slider::new(&mut state.max_db, -150.0..=20.0).text("Max dB"));
+                        ui.add(egui::Slider::new(&mut state.min_db, -150.0..=20.0).text("Min dB"));
+                        
+                        // Colorbar Legend
+                        let mut legend_pixels = Vec::with_capacity(60 * 10);
+                        for _y in 0..10 {
+                            for x in 0..60 {
+                                let norm = x as f64 / 59.0;
+                                let r = (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+                                let g = (norm * 3.0 - 2.0).clamp(0.0, 1.0);
+                                let b = (norm * 3.0).clamp(0.0, 1.0) - (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+                                legend_pixels.push(egui::Color32::from_rgb(
+                                    (r * 255.0) as u8,
+                                    (g * 255.0) as u8,
+                                    (b * 255.0) as u8,
+                                ));
                             }
                         }
+                        let legend_img = egui::ColorImage::new([60, 10], legend_pixels);
+                        let legend_tex = ui.ctx().load_texture("waterfall_legend", legend_img, egui::TextureOptions::LINEAR);
+                        ui.add(egui::Image::new(&legend_tex).fit_to_exact_size(egui::vec2(60.0, 10.0)));
+                        ui.label(egui::RichText::new("Legend:").color(Theme::TEXT_SECONDARY));
+                    });
+                });
 
-                        if pixels.len() == width * height {
-                            let img = egui::ColorImage::new([width, height], pixels);
-                            let texture = ui.ctx().load_texture(
-                                "waterfall_texture",
-                                img,
-                                egui::TextureOptions::LINEAR,
-                            );
-                            
-                            let plot = egui_plot::Plot::new("waterfall_plot")
-                                .height(250.0)
-                                .allow_drag(true)
-                                .allow_zoom(true)
-                                .link_axis(link_group, [true, false])
-                                .show_axes([true, false])
-                                .x_axis_label("Baseband Offset Frequency (MHz)")
-                                .show_grid(false);
-                            
-                            let inner = plot.show(ui, |plot_ui| {
-                                let x_min = -signal.output_sample_rate_mhz / 2.0;
-                                let x_max = signal.output_sample_rate_mhz / 2.0;
-                                
-                                let image = egui_plot::PlotImage::new(
-                                    "waterfall_img",
-                                    texture.id(),
-                                    egui_plot::PlotPoint::new((x_max + x_min) / 2.0, height as f64 / 2.0),
-                                    [(x_max - x_min) as f32, height as f32],
-                                );
-                                plot_ui.image(image);
-                                
-                                plot_ui.pointer_coordinate()
-                            });
+                // The texture is rebuilt and re-uploaded every frame, so its width is
+                // capped independently of the spectrum length. Columns fold together by
+                // max-hold rather than picking one bin, so a tone narrower than a column
+                // still paints it instead of flickering in and out between frames.
+                let width = new_len.min(WATERFALL_MAX_COLUMNS);
+                let height = history.len();
+                if width > 0 && height > 0 {
+                    let mut pixels = Vec::with_capacity(width * height);
+                    let range_db = (state.max_db - state.min_db).max(0.1);
 
-                            if let Some(coord) = inner.inner {
-                                inner.response.on_hover_ui_at_pointer(|ui| {
-                                    let frame_idx = (coord.y.round() as usize).clamp(0, height.saturating_sub(1));
-                                    
-                                    let x_min = -signal.output_sample_rate_mhz / 2.0;
-                                    let x_max = signal.output_sample_rate_mhz / 2.0;
-                                    let freq_span = x_max - x_min;
-                                    let x_norm = ((coord.x - x_min) / freq_span).clamp(0.0, 1.0);
-                                    let bin_idx = (x_norm * (width as f64 - 1.0)).round() as usize;
+                    for row in history.iter() {
+                        if row.len() == new_len {
+                            for col in 0..width {
+                                let lo = col * new_len / width;
+                                let hi = (((col + 1) * new_len / width).max(lo + 1)).min(new_len);
+                                let mag = row[lo..hi]
+                                    .iter()
+                                    .copied()
+                                    .fold(f64::NEG_INFINITY, f64::max);
 
-                                    let mag = history.get(frame_idx)
-                                        .and_then(|row| row.get(bin_idx))
-                                        .copied()
-                                        .unwrap_or(-150.0);
+                                // Map dBFS using dynamic range
+                                let norm = ((mag - state.min_db) / range_db).clamp(0.0, 1.0);
 
-                                    ui.label(egui::RichText::new(format!("Freq: {:.3} MHz", coord.x)).strong());
-                                    ui.label(format!("Time: {} frames ago", frame_idx));
-                                    ui.label(format!("Magnitude: {:.1} dBFS", mag));
-                                });
+                                // Magma/Inferno style colormap: Black -> Blue -> Purple -> Red -> Yellow
+                                let r = (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+                                let g = (norm * 3.0 - 2.0).clamp(0.0, 1.0);
+                                let b = (norm * 3.0).clamp(0.0, 1.0) - (norm * 3.0 - 1.0).clamp(0.0, 1.0);
+
+                                pixels.push(egui::Color32::from_rgb(
+                                    (r * 255.0) as u8,
+                                    (g * 255.0) as u8,
+                                    (b * 255.0) as u8,
+                                ));
                             }
                         }
                     }
-                });
+
+                    if pixels.len() == width * height {
+                        let img = egui::ColorImage::new([width, height], pixels);
+                        let texture = ui.ctx().load_texture(
+                            "waterfall_texture",
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        
+                        // The y axis is shown, and both plots pin the same width, so the
+                        // waterfall's columns stay under the matching spectrum bins.
+                        // Newest row is at the top, so the label counts back from there.
+                        let plot = egui_plot::Plot::new("waterfall_plot")
+                            .height(250.0)
+                            .allow_drag(true)
+                            .allow_zoom(true)
+                            .link_axis(link_group, [true, false])
+                            .show_axes([true, true])
+                            .x_axis_label("Baseband Offset Frequency (MHz)")
+                            .y_axis_label("Frames Ago")
+                            .y_axis_min_width(PLOT_Y_AXIS_WIDTH)
+                            .y_axis_formatter(move |mark, _| {
+                                let ago = height as f64 - mark.value;
+                                if !(0.0..=height as f64).contains(&ago) {
+                                    String::new()
+                                } else {
+                                    format!("{ago:.0}")
+                                }
+                            })
+                            .show_grid(false);
+                        
+                        let inner = plot.show(ui, |plot_ui| {
+                            let x_min = -signal.output_sample_rate_mhz / 2.0;
+                            let x_max = signal.output_sample_rate_mhz / 2.0;
+                            
+                            let image = egui_plot::PlotImage::new(
+                                "waterfall_img",
+                                texture.id(),
+                                egui_plot::PlotPoint::new((x_max + x_min) / 2.0, height as f64 / 2.0),
+                                [(x_max - x_min) as f32, height as f32],
+                            );
+                            plot_ui.image(image);
+                            
+                            plot_ui.pointer_coordinate()
+                        });
+
+                        if let Some(coord) = inner.inner {
+                            inner.response.on_hover_ui_at_pointer(|ui| {
+                                // Newest row is drawn at the top (y = height), and
+                                // history[0] is the newest, so the index counts down.
+                                let frame_idx = (height as f64 - coord.y)
+                                    .round()
+                                    .clamp(0.0, height.saturating_sub(1) as f64)
+                                    as usize;
+                                
+                                let x_min = -signal.output_sample_rate_mhz / 2.0;
+                                let x_max = signal.output_sample_rate_mhz / 2.0;
+                                let freq_span = x_max - x_min;
+                                let x_norm = ((coord.x - x_min) / freq_span).clamp(0.0, 1.0);
+                                // Index the spectrum, not the (possibly narrower) texture.
+                                let bin_idx = (x_norm * (new_len as f64 - 1.0)).round() as usize;
+
+                                let mag = history.get(frame_idx)
+                                    .and_then(|row| row.get(bin_idx))
+                                    .copied()
+                                    .unwrap_or(-150.0);
+
+                                ui.label(egui::RichText::new(format!("Freq: {:.3} MHz", coord.x)).strong());
+                                ui.label(format!("Time: {} frames ago", frame_idx));
+                                ui.label(format!("Magnitude: {:.1} dBFS", mag));
+                            });
+                        }
+                    }
+                }
             });
         });
     } else {
@@ -485,6 +599,18 @@ pub fn show_spectrum_view(
             ui.heading("No signal processed yet");
             ui.label("Configure a signal source and ADC tile to see the spectrum.");
         });
+    }
+    window_changed
+}
+
+/// One-line summary of what each window buys, for the picker's tooltips.
+fn window_hint(window: FftWindow) -> &'static str {
+    match window {
+        FftWindow::Hanning => "General purpose. Sidelobes -31 dB, so a strong tone's skirt is visible on the trace.",
+        FftWindow::Hamming => "Lowest first sidelobe of the narrow windows, but its skirt decays slowly.",
+        FftWindow::BlackmanHarris => "Sidelobes -92 dB: a tone shows one clean lobe. ~36% wider than Hanning at -3 dB.",
+        FftWindow::FlatTop => "Amplitude accuracy: reads a tone's true level however it falls between bins. Widest lobe.",
+        FftWindow::Rectangular => "No window. Sharpest lobe, worst leakage — only for coherently sampled tones.",
     }
 }
 
@@ -517,6 +643,13 @@ struct SpectrumPlot<'a> {
     show_nyquist_zones: bool,
     /// Band the decimation chain keeps: (passband edge, output Nyquist) in MHz.
     ddc_keep_band_mhz: Option<(f64, f64)>,
+    /// Window `spectrum` was computed with, so peak picking knows the shape of a tone's own
+    /// leakage skirt.
+    window: FftWindow,
+    /// Resolution bandwidth of `spectrum`, in MHz. The trace is zero-padded for display, so
+    /// its point spacing is finer than this; peak picking needs the real figure. 0 disables
+    /// main-lobe suppression.
+    resolution_bw_mhz: f64,
     /// Draw the ±0.4·Fout usable-bandwidth edges on an output plot.
     usable_band_mhz: Option<f64>,
     show_dc_marker: bool,
@@ -544,6 +677,8 @@ impl Default for SpectrumPlot<'_> {
             usable_band_mhz: None,
             show_dc_marker: false,
             show_peak_markers: false,
+            window: crate::dsp::DEFAULT_DISPLAY_WINDOW,
+            resolution_bw_mhz: 0.0,
             legend: Vec::new(),
             link_group: None,
         }
@@ -567,6 +702,8 @@ fn show_single_spectrum(ui: &mut egui::Ui, p: SpectrumPlot<'_>) {
         usable_band_mhz,
         show_dc_marker,
         show_peak_markers,
+        window,
+        resolution_bw_mhz,
         ref legend,
         link_group,
     } = p;
@@ -587,7 +724,7 @@ fn show_single_spectrum(ui: &mut egui::Ui, p: SpectrumPlot<'_>) {
         }
 
         if show_peak_markers {
-            let peaks = find_spectral_peaks(spectrum, freq_axis, -100.0);
+            let peaks = find_spectral_peaks(spectrum, freq_axis, -100.0, resolution_bw_mhz, window);
             if peaks.len() >= 2 {
                 let p1 = peaks[0];
                 let p2 = peaks[1];
@@ -642,6 +779,7 @@ fn show_single_spectrum(ui: &mut egui::Ui, p: SpectrumPlot<'_>) {
             "Frequency (MHz)"
         })
         .y_axis_label("Magnitude (dBFS)")
+        .y_axis_min_width(PLOT_Y_AXIS_WIDTH)
         .include_y(-150.0)
         .include_y(10.0);
 
@@ -802,7 +940,7 @@ fn show_single_spectrum(ui: &mut egui::Ui, p: SpectrumPlot<'_>) {
 
         if show_peak_markers {
             // Render Peak markers as vertical lines
-            let peaks = find_spectral_peaks(spectrum, freq_axis, -100.0);
+            let peaks = find_spectral_peaks(spectrum, freq_axis, -100.0, resolution_bw_mhz, window);
             for (idx, pk) in peaks.iter().take(2).enumerate() {
                 let pk_line_points: PlotPoints = vec![[pk.freq_mhz, -150.0], [pk.freq_mhz, pk.mag_dbfs]].into();
                 let pk_color = if idx == 0 { Theme::ACCENT_PRIMARY } else { Theme::ACCENT_SECONDARY };
@@ -843,5 +981,89 @@ mod tests {
             assert_eq!(history.len(), 1);
             assert_eq!(history.front().unwrap().len(), 200);
         });
+    }
+
+    fn hanning_tone(n: usize, fs: f64, entries: &[(f64, f64)]) -> Vec<num_complex::Complex<f64>> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                entries.iter().fold(
+                    num_complex::Complex::new(0.0, 0.0),
+                    |acc, &(f_mhz, amp)| {
+                        let a = 2.0 * std::f64::consts::PI * f_mhz * t;
+                        acc + num_complex::Complex::new(amp * a.cos(), amp * a.sin())
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Display padding resolves the window's sidelobes into real local maxima — a single tone
+    /// produces dozens. The marker readout must report one signal, not a skirt.
+    #[test]
+    fn peak_finder_reports_one_peak_for_one_tone() {
+        use crate::dsp::{compute_spectrum_padded, FftWindow};
+
+        let n = 512;
+        let fs = 500.0;
+        let rbw = fs / n as f64;
+        let samples = hanning_tone(n, fs, &[(100.0, 0.5)]);
+        let (spec, freq) = compute_spectrum_padded(&samples, n, fs, FftWindow::Hanning, 8);
+
+        let raw = find_spectral_peaks(&spec, &freq, -100.0, 0.0, FftWindow::Hanning);
+        assert!(
+            raw.len() > 10,
+            "padded trace should expose sidelobes as local maxima, else this proves nothing; got {}",
+            raw.len()
+        );
+
+        let peaks = find_spectral_peaks(&spec, &freq, -100.0, rbw, FftWindow::Hanning);
+        assert_eq!(
+            peaks.len(),
+            1,
+            "one tone should report one peak, got {} (first extra at {:.2} MHz, {:.1} dBFS)",
+            peaks.len(),
+            peaks.get(1).map(|p| p.freq_mhz).unwrap_or(0.0),
+            peaks.get(1).map(|p| p.mag_dbfs).unwrap_or(0.0),
+        );
+        assert!((peaks[0].freq_mhz - 100.0).abs() < 1.0);
+    }
+
+    /// Suppression must not swallow a genuine second signal standing above the leakage.
+    #[test]
+    fn peak_finder_keeps_a_real_second_tone() {
+        use crate::dsp::{compute_spectrum_padded, FftWindow};
+
+        let n = 512;
+        let fs = 500.0;
+        let rbw = fs / n as f64;
+        // Second tone 12 dB down — far above Hanning's -31.5 dB first sidelobe.
+        let samples = hanning_tone(n, fs, &[(100.0, 0.5), (150.0, 0.125)]);
+        let (spec, freq) = compute_spectrum_padded(&samples, n, fs, FftWindow::Hanning, 8);
+
+        let peaks = find_spectral_peaks(&spec, &freq, -100.0, rbw, FftWindow::Hanning);
+        assert_eq!(peaks.len(), 2, "expected exactly the two tones");
+        assert!((peaks[0].freq_mhz - 100.0).abs() < 1.0);
+        assert!(
+            (peaks[1].freq_mhz - 150.0).abs() < 1.0,
+            "second peak should be the 150 MHz tone, got {:.2} MHz",
+            peaks[1].freq_mhz
+        );
+    }
+
+    /// A weak tone close in should still be found once it clears the neighbour's skirt.
+    #[test]
+    fn peak_finder_keeps_a_close_tone_above_the_skirt() {
+        use crate::dsp::{compute_spectrum_padded, FftWindow};
+
+        let n = 512;
+        let fs = 500.0;
+        let rbw = fs / n as f64;
+        // 8 bins out, 25 dB down: Hanning leakage there is ~-53 dB, so this stands clear.
+        let samples = hanning_tone(n, fs, &[(100.0, 0.5), (100.0 + 8.0 * rbw, 0.028)]);
+        let (spec, freq) = compute_spectrum_padded(&samples, n, fs, FftWindow::Hanning, 8);
+
+        let peaks = find_spectral_peaks(&spec, &freq, -100.0, rbw, FftWindow::Hanning);
+        assert_eq!(peaks.len(), 2, "close-in tone above the skirt should survive");
     }
 }
