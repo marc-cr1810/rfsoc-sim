@@ -4,6 +4,8 @@
 
 use crate::rfdc::{AdcBlock, AdcTile, CoarseMixFreq, MixerType, MixerMode as RfdcMixerMode, FineMixerScale};
 use num_complex::Complex;
+use rayon::prelude::*;
+use realfft::RealFftPlanner;
 use rustfft::FftPlanner;
 use std::f64::consts::PI;
 
@@ -76,6 +78,63 @@ use std::cell::RefCell;
 
 thread_local! {
     static FFT_PLANNER: RefCell<FftPlanner<f64>> = RefCell::new(FftPlanner::new());
+    /// Separate planner for the real-input transforms. Everything from the ADC pin to the
+    /// mixer is a real voltage, and a real-to-complex transform of it costs half what running
+    /// the same data through a complex transform with a zero imaginary part costs.
+    static REAL_FFT_PLANNER: RefCell<RealFftPlanner<f64>> = RefCell::new(RealFftPlanner::new());
+}
+
+/// Sample count above which a per-sample stage is spread across the thread pool.
+///
+/// Every stage below is a pure function of the sample index, so splitting one into chunks is
+/// always *correct*; it is only worth doing once the chunk carries more work than the hand-off
+/// costs. A `Fast`/×1 capture is 4096 samples and finishes in tens of microseconds, so it stays
+/// on the calling thread.
+pub(crate) const PAR_MIN_LEN: usize = 32_768;
+
+/// Samples one worker takes at a time from a parallel stage.
+///
+/// Sized so a chunk is a few tens of microseconds of work — long enough to amortise the
+/// hand-off, short enough that the last chunk cannot leave the other workers idle for long.
+pub(crate) const PAR_CHUNK: usize = 8_192;
+
+/// Split `out` into [`PAR_CHUNK`]-sized pieces and run `fill(first_index, piece)` over each.
+///
+/// The split is by index and never by thread, so the same buffer is always divided the same
+/// way — a stage that seeds anything off `first_index` produces bit-identical output whether it
+/// ran on one thread or all of them. Short buffers take the same route without the pool, where
+/// the hand-off would cost more than the work.
+pub(crate) fn for_each_chunk<T: Send>(
+    out: &mut [T],
+    fill: impl Fn(usize, &mut [T]) + Sync + Send,
+) {
+    if out.len() >= PAR_MIN_LEN {
+        out.par_chunks_mut(PAR_CHUNK)
+            .enumerate()
+            .for_each(|(c, chunk)| fill(c * PAR_CHUNK, chunk));
+    } else {
+        out.chunks_mut(PAR_CHUNK)
+            .enumerate()
+            .for_each(|(c, chunk)| fill(c * PAR_CHUNK, chunk));
+    }
+}
+
+/// [`for_each_chunk`], for a stage that also reports whether something happened somewhere.
+fn any_chunk<T: Send>(
+    out: &mut [T],
+    fill: impl Fn(usize, &mut [T]) -> bool + Sync + Send,
+) -> bool {
+    if out.len() >= PAR_MIN_LEN {
+        out.par_chunks_mut(PAR_CHUNK)
+            .enumerate()
+            .map(|(c, chunk)| fill(c * PAR_CHUNK, chunk))
+            .reduce(|| false, |a, b| a || b)
+    } else {
+        out.chunks_mut(PAR_CHUNK)
+            .enumerate()
+            .map(|(c, chunk)| fill(c * PAR_CHUNK, chunk))
+            .fold(false, |a, b| a || b)
+    }
 }
 
 /// FFT window functions for spectral analysis.
@@ -97,48 +156,50 @@ impl FftWindow {
         FftWindow::Rectangular,
     ];
 
-    pub fn apply(&self, buffer: &mut [Complex<f64>]) {
-        let n = buffer.len();
-        if n == 0 {
-            return;
-        }
+    /// The window's coefficient at sample `i` of `n`.
+    fn coefficient(&self, i: usize, n: usize) -> f64 {
+        let phi = 2.0 * PI * i as f64 / n as f64;
         match self {
-            FftWindow::Hanning => {
-                for (i, sample) in buffer.iter_mut().enumerate() {
-                    let w = 0.5 * (1.0 - (2.0 * PI * i as f64 / n as f64).cos());
-                    *sample *= w;
-                }
-            }
-            FftWindow::Hamming => {
-                for (i, sample) in buffer.iter_mut().enumerate() {
-                    let w = 0.54 - 0.46 * (2.0 * PI * i as f64 / n as f64).cos();
-                    *sample *= w;
-                }
-            }
+            FftWindow::Hanning => 0.5 * (1.0 - phi.cos()),
+            FftWindow::Hamming => 0.54 - 0.46 * phi.cos(),
             FftWindow::BlackmanHarris => {
-                for (i, sample) in buffer.iter_mut().enumerate() {
-                    let a0 = 0.35875;
-                    let a1 = 0.48829;
-                    let a2 = 0.14128;
-                    let a3 = 0.01168;
-                    let phi = 2.0 * PI * i as f64 / n as f64;
-                    let w = a0 - a1 * phi.cos() + a2 * (2.0 * phi).cos() - a3 * (3.0 * phi).cos();
-                    *sample *= w;
-                }
+                let a0 = 0.35875;
+                let a1 = 0.48829;
+                let a2 = 0.14128;
+                let a3 = 0.01168;
+                a0 - a1 * phi.cos() + a2 * (2.0 * phi).cos() - a3 * (3.0 * phi).cos()
             }
             FftWindow::FlatTop => {
-                for (i, sample) in buffer.iter_mut().enumerate() {
-                    let a0 = 0.21557895;
-                    let a1 = 0.41663158;
-                    let a2 = 0.277263158;
-                    let a3 = 0.083578947;
-                    let a4 = 0.006947368;
-                    let phi = 2.0 * PI * i as f64 / n as f64;
-                    let w = a0 - a1 * phi.cos() + a2 * (2.0 * phi).cos() - a3 * (3.0 * phi).cos() + a4 * (4.0 * phi).cos();
-                    *sample *= w;
-                }
+                let a0 = 0.21557895;
+                let a1 = 0.41663158;
+                let a2 = 0.277263158;
+                let a3 = 0.083578947;
+                let a4 = 0.006947368;
+                a0 - a1 * phi.cos() + a2 * (2.0 * phi).cos() - a3 * (3.0 * phi).cos()
+                    + a4 * (4.0 * phi).cos()
             }
-            FftWindow::Rectangular => {}
+            FftWindow::Rectangular => 1.0,
+        }
+    }
+
+    pub fn apply(&self, buffer: &mut [Complex<f64>]) {
+        let n = buffer.len();
+        if n == 0 || *self == FftWindow::Rectangular {
+            return;
+        }
+        for (i, sample) in buffer.iter_mut().enumerate() {
+            *sample *= self.coefficient(i, n);
+        }
+    }
+
+    /// Window a real buffer in place. Same coefficients as [`Self::apply`].
+    pub fn apply_real(&self, buffer: &mut [f64]) {
+        let n = buffer.len();
+        if n == 0 || *self == FftWindow::Rectangular {
+            return;
+        }
+        for (i, sample) in buffer.iter_mut().enumerate() {
+            *sample *= self.coefficient(i, n);
         }
     }
 
@@ -204,9 +265,12 @@ impl std::fmt::Display for FftWindow {
 ///
 /// The RF chain is modelled on complex samples, but the converter input is a single-ended
 /// real voltage: only the real part is ever sampled. Collapsing to a real signal here keeps
-/// the pre-ADC spectrum, the sampler and the folded spectrum on one consistent scale.
-pub fn physical_voltage(samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
-    samples.iter().map(|s| Complex::new(s.re, 0.0)).collect()
+/// the pre-ADC spectrum, the sampler and the folded spectrum on one consistent scale — and
+/// everything from here to the mixer then runs on `f64` rather than on a `Complex<f64>` whose
+/// imaginary half is known to be zero, which halves the memory traffic of the widest buffers
+/// in the program and lets the per-sample loops vectorise.
+pub fn physical_voltage(samples: &[Complex<f64>]) -> Vec<f64> {
+    samples.iter().map(|s| s.re).collect()
 }
 
 /// Apply the converter's analog input bandwidth roll-off to the wideband voltage waveform.
@@ -214,41 +278,43 @@ pub fn physical_voltage(samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
 /// Runs before sampling so that content in high Nyquist zones aliases down already
 /// attenuated, the way a real track-and-hold behaves.
 pub fn apply_analog_bandwidth(
-    samples: &[Complex<f64>],
+    samples: &[f64],
     sample_rate_mhz: f64,
     afe: &crate::rfdc::AnalogFrontEnd,
-) -> Vec<Complex<f64>> {
-    if !afe.enabled || samples.is_empty() || sample_rate_mhz <= 0.0 {
+) -> Vec<f64> {
+    if !afe.enabled || samples.len() < 2 || sample_rate_mhz <= 0.0 {
         return samples.to_vec();
     }
 
     let n = samples.len();
-    let mut buffer: Vec<Complex<f64>> = samples.to_vec();
-    FFT_PLANNER.with(|planner| {
-        let fft = planner.borrow_mut().plan_fft_forward(n);
-        fft.process(&mut buffer);
+    let (fft, ifft) = REAL_FFT_PLANNER.with(|planner| {
+        let mut planner = planner.borrow_mut();
+        (planner.plan_fft_forward(n), planner.plan_fft_inverse(n))
     });
 
-    // Scale each bin by the analog response, treating bins above N/2 as negative frequencies.
-    // The curve is real and even, and depends only on the bin grid and the AFE settings, so it
-    // is built once and reused rather than evaluated per bin per capture.
+    // The signal is real, so the transform is conjugate-symmetric and only the non-negative
+    // half of the bins exists. That is also why the gain table is half length.
+    let mut input = samples.to_vec();
+    let mut spectrum = fft.make_output_vec();
+    fft.process(&mut input, &mut spectrum)
+        .expect("real FFT length mismatch");
+
+    // Scale each bin by the analog response. The curve is real and even, and depends only on
+    // the bin grid and the AFE settings, so it is built once and reused rather than evaluated
+    // per bin per capture.
     let gains = analog_bandwidth_gains(n, sample_rate_mhz, afe);
-    for (bin, &g) in buffer.iter_mut().zip(gains.iter()) {
+    for (bin, &g) in spectrum.iter_mut().zip(gains.iter()) {
         *bin *= g;
     }
 
-    FFT_PLANNER.with(|planner| {
-        let ifft = planner.borrow_mut().plan_fft_inverse(n);
-        ifft.process(&mut buffer);
-    });
-
-    // In place: the caller wants the real voltage back, and at these lengths a second buffer
-    // is megabytes of pointless traffic.
+    let mut out = vec![0.0; n];
+    ifft.process(&mut spectrum, &mut out)
+        .expect("real inverse FFT length mismatch");
     let norm = 1.0 / n as f64;
-    for c in buffer.iter_mut() {
-        *c = Complex::new(c.re * norm, 0.0);
+    for v in out.iter_mut() {
+        *v *= norm;
     }
-    buffer
+    out
 }
 
 /// Identifies an analog-bandwidth gain curve: the bin grid, and the response over it.
@@ -266,6 +332,9 @@ thread_local! {
 }
 
 /// Analog roll-off gain per FFT bin, memoised on the grid it was built for.
+///
+/// `n` is the transform length; the table covers the `n/2 + 1` non-negative-frequency bins a
+/// real-input transform produces.
 fn analog_bandwidth_gains(
     n: usize,
     sample_rate_mhz: f64,
@@ -287,15 +356,8 @@ fn analog_bandwidth_gains(
         }
 
         let values = std::rc::Rc::new(
-            (0..n)
-                .map(|i| {
-                    let k = if i <= n / 2 {
-                        i as f64
-                    } else {
-                        i as f64 - n as f64
-                    };
-                    afe.gain_linear(k * sample_rate_mhz / n as f64)
-                })
+            (0..=n / 2)
+                .map(|i| afe.gain_linear(i as f64 * sample_rate_mhz / n as f64))
                 .collect::<Vec<f64>>(),
         );
         *slot = Some((key, values.clone()));
@@ -306,9 +368,9 @@ fn analog_bandwidth_gains(
 /// Apply analog hardware non-idealities (HD2/HD3 distortion) before sampling.
 /// Distortion is applied to the real voltage waveform.
 pub fn apply_analog_non_idealities(
-    samples: &[Complex<f64>],
+    samples: &[f64],
     non_idealities: &crate::rfdc::AdcNonIdealities,
-) -> Vec<Complex<f64>> {
+) -> Vec<f64> {
     if !non_idealities.enabled || samples.is_empty() {
         return samples.to_vec();
     }
@@ -331,35 +393,35 @@ pub fn apply_analog_non_idealities(
     // The squaring term also generates DC. The front end is AC-coupled through the balun,
     // so remove the mean rather than letting it appear as a DC offset.
     let mean_sq = if a2 > 0.0 {
-        samples.iter().map(|s| s.re * s.re).sum::<f64>() / samples.len() as f64
+        samples.iter().map(|v| v * v).sum::<f64>() / samples.len() as f64
     } else {
         0.0
     };
 
-    samples
-        .iter()
-        .map(|&s| {
-            let v = s.re;
-            let mut out = v;
-            if a2 > 0.0 {
-                out += a2 * (v * v - mean_sq);
-            }
-            if a3 > 0.0 {
-                out += a3 * v * v * v;
-            }
-            Complex::new(out, 0.0)
-        })
-        .collect()
+    let distort = |&v: &f64| {
+        let mut out = v;
+        if a2 > 0.0 {
+            out += a2 * (v * v - mean_sq);
+        }
+        if a3 > 0.0 {
+            out += a3 * v * v * v;
+        }
+        out
+    };
+
+    if samples.len() >= PAR_MIN_LEN {
+        samples.par_iter().with_min_len(PAR_CHUNK).map(distort).collect()
+    } else {
+        samples.iter().map(distort).collect()
+    }
 }
 
 /// Apply digital hardware non-idealities (Quantization, Clipping, Interleaving spurs) after sampling.
 /// Also returns a boolean indicating if clipping occurred (overrange).
 pub fn apply_digital_non_idealities(
-    samples: &[Complex<f64>],
+    samples: &[f64],
     non_idealities: &crate::rfdc::AdcNonIdealities,
-) -> (Vec<Complex<f64>>, bool) {
-    let mut overrange = false;
-
+) -> (Vec<f64>, bool) {
     if samples.is_empty() {
         return (Vec::new(), false);
     }
@@ -394,25 +456,30 @@ pub fn apply_digital_non_idealities(
         };
         noise_sigma = (total_noise_pwr - quant_noise_pwr).max(0.0).sqrt();
     }
-    // Deterministic per-call RNG so the floor is stable frame to frame rather than flickering.
-    let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut next_gaussian = move || -> f64 {
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        let u1 = ((rng_state >> 11) as f64 / (1u64 << 53) as f64).max(1e-300);
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        let u2 = (rng_state >> 11) as f64 / (1u64 << 53) as f64;
-        (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
-    };
+    // One run of the chain over `src`, writing `dst`, for samples whose absolute indices start
+    // at `base`. Nothing here reads the previous sample, so a chunk only needs to know where it
+    // sits: the interleaving spur pattern comes from the absolute index, and the noise stream is
+    // seeded from it. That keeps the floor deterministic — the same capture gives the same
+    // realisation whether or not it was split — rather than flickering frame to frame.
+    let run = |base: usize, dst: &mut [f64]| -> bool {
+        let src = &samples[base..base + dst.len()];
+        let mut overrange = false;
+        let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15 ^ splitmix64(base as u64 + 1);
+        let mut next_gaussian = move || -> f64 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            let u1 = ((rng_state >> 11) as f64 / (1u64 << 53) as f64).max(1e-300);
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            let u2 = (rng_state >> 11) as f64 / (1u64 << 53) as f64;
+            (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+        };
 
-    let processed: Vec<Complex<f64>> = samples
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| {
-            let mut v = s.re;
+        for (k, (&s, out)) in src.iter().zip(dst.iter_mut()).enumerate() {
+            let i = base + k;
+            let mut v = s;
 
             // 0. Thermal + aperture-jitter noise setting the ENOB-limited floor
             if noise_sigma > 0.0 {
@@ -425,9 +492,9 @@ pub fn apply_digital_non_idealities(
                 let sign_fs4 = if i % 4 == 0 || i % 4 == 1 { 1.0 } else { -1.0 };
                 // Mismatch scales with input
                 v += v * spur_amp * (sign_fs2 + sign_fs4) * 0.5;
-                
+
                 // Offset spur (signal independent) at Fs/2
-                v += spur_amp * sign_fs2 * 0.1; 
+                v += spur_amp * sign_fs2 * 0.1;
             }
 
             // 2. Clipping
@@ -451,11 +518,25 @@ pub fn apply_digital_non_idealities(
                 v = quant / half_q;
             }
 
-            Complex::new(v, 0.0)
-        })
-        .collect();
+            *out = v;
+        }
+        overrange
+    };
+
+    let mut processed = vec![0.0; samples.len()];
+    let overrange = any_chunk(&mut processed, run);
 
     (processed, overrange)
+}
+
+/// Mix a counter into a well-distributed seed, so chunk `n` and chunk `n+1` start their noise
+/// streams somewhere unrelated rather than a few xorshift steps apart.
+pub(crate) fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Resolve a requested NCO frequency to the value the mixer actually runs at.
@@ -504,8 +585,8 @@ pub fn process_adc_block(
     };
     // Collapse to the real voltage actually present at the converter pin before doing
     // anything else, so every downstream spectrum shares one amplitude reference.
-    let dsa_samples: Vec<Complex<f64>> = if dsa_scale < 1.0 {
-        input_samples.iter().map(|s| Complex::new(s.re * dsa_scale, 0.0)).collect()
+    let dsa_samples: Vec<f64> = if dsa_scale < 1.0 {
+        input_samples.iter().map(|s| s.re * dsa_scale).collect()
     } else {
         physical_voltage(input_samples)
     };
@@ -523,7 +604,7 @@ pub fn process_adc_block(
     let wide_pad = display_pad_factor(wide_fft);
 
     // 2. Input spectrum (full wideband) — the real voltage at the ADC pin
-    let (input_spectrum, input_freq) = compute_spectrum_positive_padded(
+    let (input_spectrum, input_freq) = compute_spectrum_positive_padded_real(
         &analog_samples,
         wide_fft,
         input_sample_rate_mhz,
@@ -535,7 +616,7 @@ pub fn process_adc_block(
         let real_source = physical_voltage(samples);
         // Matched to the input pane's length: the two are drawn overlaid, and transforms of
         // different lengths would put their noise floors at different levels.
-        let (raw_spec, _) = compute_spectrum_positive_padded(
+        let (raw_spec, _) = compute_spectrum_positive_padded_real(
             &real_source,
             wide_fft,
             input_sample_rate_mhz,
@@ -555,8 +636,13 @@ pub fn process_adc_block(
     // Folded spectrum: actual ADC digital output spectrum (0..Fs/2)
     let tile_fft = analysis_fft_size(tile_samples.len());
     let tile_pad = display_pad_factor(tile_fft);
-    let (folded_spectrum, folded_freq) =
-        compute_spectrum_positive_padded(&tile_samples, tile_fft, fs_mhz, display_window, tile_pad);
+    let (folded_spectrum, folded_freq) = compute_spectrum_positive_padded_real(
+        &tile_samples,
+        tile_fft,
+        fs_mhz,
+        display_window,
+        tile_pad,
+    );
 
     let nco_freq = resolve_nco_freq(ms.freq, fs_mhz, block.nyquist_zone.is_even());
 
@@ -679,6 +765,40 @@ fn windowed_padded_fft(
     buffer
 }
 
+/// [`windowed_padded_fft`] for a real signal: same transform, but only the `len/2 + 1` bins a
+/// real input can produce, at half the cost of running the same data through a complex FFT.
+fn windowed_padded_rfft(
+    samples: &[f64],
+    n: usize,
+    window: FftWindow,
+    pad: usize,
+) -> Vec<Complex<f64>> {
+    let mut buffer: Vec<f64> = samples[..n].to_vec();
+    window.apply_real(&mut buffer);
+    buffer.resize(n * pad.max(1), 0.0);
+    let len = buffer.len();
+    let fft = REAL_FFT_PLANNER.with(|planner| planner.borrow_mut().plan_fft_forward(len));
+    let mut spectrum = fft.make_output_vec();
+    fft.process(&mut buffer, &mut spectrum)
+        .expect("real FFT length mismatch");
+    spectrum
+}
+
+/// Magnitudes in dBFS, from bins that have not been normalised yet.
+///
+/// Works in power rather than amplitude — `10·log10(|c|²)` instead of `20·log10(|c|)` — which
+/// drops a square root per bin. A display trace is hundreds of thousands of bins after padding,
+/// so this is worth doing and worth spreading across the pool.
+fn bins_to_dbfs(bins: &[Complex<f64>], norm: f64) -> Vec<f64> {
+    let norm_sq = norm * norm;
+    let to_db = |c: &Complex<f64>| 10.0 * (c.norm_sqr() * norm_sq).max(1e-30).log10();
+    if bins.len() >= PAR_MIN_LEN {
+        bins.par_iter().with_min_len(PAR_CHUNK).map(to_db).collect()
+    } else {
+        bins.iter().map(to_db).collect()
+    }
+}
+
 /// Compute the power spectrum of complex samples using FFT with a specific window function.
 ///
 /// `pad` zero-pads the transform to `pad`× the analysed length, interpolating the trace for
@@ -700,13 +820,7 @@ pub fn compute_spectrum_padded(
     // Compute magnitude in dBFS. Normalisation uses the *analysed* length `n`, not the padded
     // length — the padding contributes no energy, so scaling by it would under-read every bin.
     let norm = 1.0 / (n as f64 * window.coherent_gain());
-    let spectrum_dbfs: Vec<f64> = buffer
-        .iter()
-        .map(|c| {
-            let mag = c.norm() * norm;
-            20.0 * mag.max(1e-15).log10()
-        })
-        .collect();
+    let spectrum_dbfs = bins_to_dbfs(&buffer, norm);
 
     // FFT-shift: move DC to centre
     let mut shifted = vec![0.0; len];
@@ -757,29 +871,62 @@ pub fn compute_spectrum_positive_padded(
     }
     let buffer = windowed_padded_fft(samples, n, window, pad);
     let len = buffer.len();
-
-    let norm = 1.0 / (n as f64 * window.coherent_gain());
     let half = len / 2;
+    let norm = 1.0 / (n as f64 * window.coherent_gain());
 
-    // Take only positive frequencies (0..Fs/2)
-    let spectrum_dbfs: Vec<f64> = buffer[..=half]
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let mut mag = c.norm() * norm;
-            // Scale positive frequencies by 2 (except DC and Nyquist) to account for folded negative energy
-            if i > 0 && i < half {
-                mag *= 2.0;
-            }
-            20.0 * mag.max(1e-15).log10()
-        })
-        .collect();
+    (
+        positive_bins_to_dbfs(&buffer[..=half], norm),
+        positive_freq_axis(len, sample_rate_mhz),
+    )
+}
 
-    let freq_axis: Vec<f64> = (0..=half)
+/// Single-sided power spectrum of a *real* signal, zero-padded by `pad`.
+///
+/// Identical output to running the same samples through [`compute_spectrum_positive_padded`]
+/// with a zero imaginary part, for half the transform cost: a real input has no independent
+/// negative-frequency bins to compute in the first place.
+pub fn compute_spectrum_positive_padded_real(
+    samples: &[f64],
+    fft_size: usize,
+    sample_rate_mhz: f64,
+    window: FftWindow,
+    pad: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = (fft_size.min(samples.len()) / 2) * 2;
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let bins = windowed_padded_rfft(samples, n, window, pad);
+    let len = n * pad.max(1);
+    let norm = 1.0 / (n as f64 * window.coherent_gain());
+
+    (
+        positive_bins_to_dbfs(&bins, norm),
+        positive_freq_axis(len, sample_rate_mhz),
+    )
+}
+
+/// dBFS for the non-negative half of a transform, `bins[0]` being DC and `bins[half]` Nyquist.
+///
+/// Everything between them stands in for its mirror image as well, so it carries twice the
+/// amplitude — 6.02 dB, added here rather than doubling each magnitude before the logarithm.
+fn positive_bins_to_dbfs(bins: &[Complex<f64>], norm: f64) -> Vec<f64> {
+    const FOLD_DB: f64 = 6.020_599_913_279_624; // 20·log10(2)
+    let mut dbfs = bins_to_dbfs(bins, norm);
+    if dbfs.len() > 2 {
+        let last = dbfs.len() - 1;
+        for v in &mut dbfs[1..last] {
+            *v += FOLD_DB;
+        }
+    }
+    dbfs
+}
+
+/// Bin centres of the non-negative half of a `len`-point transform, in MHz.
+fn positive_freq_axis(len: usize, sample_rate_mhz: f64) -> Vec<f64> {
+    (0..=len / 2)
         .map(|i| i as f64 * sample_rate_mhz / len as f64)
-        .collect();
-
-    (spectrum_dbfs, freq_axis)
+        .collect()
 }
 
 /// Compute single-sided (positive frequency only) power spectrum with a specific window function.
@@ -799,6 +946,25 @@ pub fn compute_spectrum_positive(
     sample_rate_mhz: f64,
 ) -> (Vec<f64>, Vec<f64>) {
     compute_spectrum_positive_with_window(samples, fft_size, sample_rate_mhz, FftWindow::Hanning)
+}
+
+/// [`compute_spectrum_positive_with_window`] for a real signal.
+pub fn compute_spectrum_positive_real_with_window(
+    samples: &[f64],
+    fft_size: usize,
+    sample_rate_mhz: f64,
+    window: FftWindow,
+) -> (Vec<f64>, Vec<f64>) {
+    compute_spectrum_positive_padded_real(samples, fft_size, sample_rate_mhz, window, 1)
+}
+
+/// [`compute_spectrum_positive`] for a real signal.
+pub fn compute_spectrum_positive_real(
+    samples: &[f64],
+    fft_size: usize,
+    sample_rate_mhz: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    compute_spectrum_positive_real_with_window(samples, fft_size, sample_rate_mhz, FftWindow::Hanning)
 }
 
 /// Half-width of the resampling kernel: 32-tap windowed sinc for >100 dB spur rejection.
@@ -858,68 +1024,82 @@ fn resampler_kernels() -> &'static [[f64; RESAMPLER_TAPS]] {
 /// Uses a high-quality windowed sinc anti-aliasing interpolator to eliminate fractional
 /// sample rate resampling artifacts (spurs).
 pub fn sample_adc_at_tile_rate(
-    wideband_samples: &[Complex<f64>],
+    wideband_samples: &[f64],
     sim_fs_mhz: f64,
     tile_fs_mhz: f64,
-) -> Vec<Complex<f64>> {
+) -> Vec<f64> {
     if tile_fs_mhz <= 0.0 || wideband_samples.is_empty() {
         return Vec::new();
     }
     let ratio = sim_fs_mhz / tile_fs_mhz;
     let num_samples = (wideband_samples.len() as f64 / ratio).floor() as usize;
-    let mut sampled = Vec::with_capacity(num_samples);
-
     let kernels = resampler_kernels();
+    let gains = resampler_kernel_gains();
     let len = wideband_samples.len() as isize;
-    let mut taps = [0.0f64; RESAMPLER_TAPS];
 
-    for n in 0..num_samples {
-        let sample_pos = n as f64 * ratio;
-        let center_idx = sample_pos.floor() as isize;
-        let frac = sample_pos - center_idx as f64;
+    // Output `n` reads a fixed window around `n · ratio` and nothing else, so a chunk needs
+    // only its own starting index.
+    let run = |base: usize, dst: &mut [f64]| {
+        for (k, out) in dst.iter_mut().enumerate() {
+            let sample_pos = (base + k) as f64 * ratio;
+            let center_idx = sample_pos.floor() as isize;
+            let frac = sample_pos - center_idx as f64;
 
-        // Blend the two nearest tabulated phases onto the exact fractional position.
-        let phase = frac * RESAMPLER_PHASES as f64;
-        let phase_idx = (phase.floor() as usize).min(RESAMPLER_PHASES - 1);
-        let t = phase - phase_idx as f64;
-        let (lo_k, hi_k) = (&kernels[phase_idx], &kernels[phase_idx + 1]);
-        for j in 0..RESAMPLER_TAPS {
-            taps[j] = lo_k[j] + t * (hi_k[j] - lo_k[j]);
-        }
+            // Blend the two nearest tabulated phases onto the exact fractional position.
+            let phase = frac * RESAMPLER_PHASES as f64;
+            let phase_idx = (phase.floor() as usize).min(RESAMPLER_PHASES - 1);
+            let t = phase - phase_idx as f64;
+            let (lo_k, hi_k) = (&kernels[phase_idx], &kernels[phase_idx + 1]);
 
-        let first = center_idx - RESAMPLER_RADIUS;
-        let mut val = 0.0;
-        let mut weight_sum = 0.0;
+            let first = center_idx - RESAMPLER_RADIUS;
+            let mut val = 0.0;
 
-        if first >= 0 && first + RESAMPLER_TAPS as isize <= len {
-            // Interior: every tap lands on a real sample.
-            let window = &wideband_samples[first as usize..first as usize + RESAMPLER_TAPS];
-            for (tap, s) in taps.iter().zip(window) {
-                val += s.re * tap;
-                weight_sum += tap;
-            }
-        } else {
-            // Near an edge, renormalise over the taps that landed inside the buffer, so the
-            // first and last few outputs keep unit gain rather than rolling off.
-            for (j, &tap) in taps.iter().enumerate() {
-                let k = first + j as isize;
-                if k >= 0 && k < len {
-                    val += wideband_samples[k as usize].re * tap;
-                    weight_sum += tap;
+            *out = if first >= 0 && first + RESAMPLER_TAPS as isize <= len {
+                // Interior: every tap lands on a real sample, so the kernel's gain is the
+                // whole kernel's — a property of the phase, not of the data, and tabulated
+                // alongside it. Hoisting it out leaves one multiply-add per tap in here.
+                let window = &wideband_samples[first as usize..first as usize + RESAMPLER_TAPS];
+                for j in 0..RESAMPLER_TAPS {
+                    val += window[j] * (lo_k[j] + t * (hi_k[j] - lo_k[j]));
                 }
-            }
+                let gain = gains[phase_idx] + t * (gains[phase_idx + 1] - gains[phase_idx]);
+                if gain.abs() > 1e-9 { val / gain } else { 0.0 }
+            } else {
+                // Near an edge, renormalise over the taps that landed inside the buffer, so
+                // the first and last few outputs keep unit gain rather than rolling off.
+                let mut weight_sum = 0.0;
+                for j in 0..RESAMPLER_TAPS {
+                    let idx = first + j as isize;
+                    if idx >= 0 && idx < len {
+                        let tap = lo_k[j] + t * (hi_k[j] - lo_k[j]);
+                        val += wideband_samples[idx as usize] * tap;
+                        weight_sum += tap;
+                    }
+                }
+                if weight_sum.abs() > 1e-9 { val / weight_sum } else { 0.0 }
+            };
         }
+    };
 
-        let final_v = if weight_sum.abs() > 1e-9 {
-            val / weight_sum
-        } else {
-            0.0
-        };
-
-        sampled.push(Complex::new(final_v, 0.0));
-    }
+    let mut sampled = vec![0.0; num_samples];
+    for_each_chunk(&mut sampled, run);
 
     sampled
+}
+
+/// Total gain of each tabulated kernel, i.e. the sum of its taps.
+///
+/// The interior branch of the resampler divides by this to hold unit gain. Summing 33 taps per
+/// output sample is the same arithmetic every time the same phase comes round, so it is done
+/// once per phase instead.
+fn resampler_kernel_gains() -> &'static [f64] {
+    static GAINS: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    GAINS.get_or_init(|| {
+        resampler_kernels()
+            .iter()
+            .map(|k| k.iter().sum::<f64>())
+            .collect()
+    })
 }
 
 /// Apply Quadrature Modulation Correction (QMC) to complex samples.
@@ -940,26 +1120,29 @@ pub fn apply_qmc(
     let sin_p = phase_rad.sin();
     let g = qmc.gain;
 
-    samples
-        .iter()
-        .map(|&s| {
-            let i_out = g * (s.re * cos_p - s.im * sin_p) + qmc.offset;
-            let q_out = g * (s.re * sin_p + s.im * cos_p);
-            Complex::new(i_out, q_out)
-        })
-        .collect()
+    let correct = |&s: &Complex<f64>| {
+        let i_out = g * (s.re * cos_p - s.im * sin_p) + qmc.offset;
+        let q_out = g * (s.re * sin_p + s.im * cos_p);
+        Complex::new(i_out, q_out)
+    };
+
+    if samples.len() >= PAR_MIN_LEN {
+        samples.par_iter().with_min_len(PAR_CHUNK).map(correct).collect()
+    } else {
+        samples.iter().map(correct).collect()
+    }
 }
 
-/// Apply the DDC mixer to time-domain samples.
+/// Apply the DDC mixer to the real samples coming off the converter.
 ///
-/// `samples`: complex input samples
+/// `samples`: real input samples, as the ADC delivers them
 /// `settings`: MixerSettings from the block configuration
 /// `nco_freq_mhz`: resolved NCO frequency in MHz (after zone wrap/flip)
 /// `sim_fs_mhz`: sampling rate of input samples in MHz (wideband simulation rate)
 /// `tile_fs_mhz`: ADC tile sampling rate in MHz
 /// `scale`: FineMixerScale factor (1.0 or 0.7071)
 pub fn apply_mixer(
-    samples: &[Complex<f64>],
+    samples: &[f64],
     settings: &crate::rfdc::MixerSettings,
     nco_freq_mhz: f64,
     sim_fs_mhz: f64,
@@ -969,8 +1152,12 @@ pub fn apply_mixer(
     // NCO phase offset, in degrees, as configured on the block.
     let phase0 = settings.phase_offset * PI / 180.0;
 
-    match settings.mixer_type {
-        MixerType::Off => samples.to_vec(),
+    let bypass = || -> Vec<Complex<f64>> {
+        samples.iter().map(|&v| Complex::new(v, 0.0)).collect()
+    };
+
+    let omega = match settings.mixer_type {
+        MixerType::Off => return bypass(),
         MixerType::Coarse => {
             let coarse_shift_mhz = match settings.coarse_mix_freq {
                 CoarseMixFreq::FsOver4 => 0.25 * tile_fs_mhz,
@@ -979,33 +1166,52 @@ pub fn apply_mixer(
                 CoarseMixFreq::Bypass | CoarseMixFreq::Off => 0.0,
             };
             if coarse_shift_mhz.abs() < 1e-12 {
-                return samples.to_vec();
+                return bypass();
             }
-            let omega = -2.0 * PI * coarse_shift_mhz / sim_fs_mhz;
-            samples
-                .iter()
-                .enumerate()
-                .map(|(i, &s)| {
-                    let angle = omega * i as f64 - phase0;
-                    s * Complex::new(angle.cos(), angle.sin()) * scale
-                })
-                .collect()
+            -2.0 * PI * coarse_shift_mhz / sim_fs_mhz
         }
-        MixerType::Fine => {
-            let omega = -2.0 * PI * nco_freq_mhz / sim_fs_mhz;
-            // Real R2C quadrature mixing: I = x[n]·cos(ωn), Q = -x[n]·sin(ωn) for a real input,
-            // which maps perfectly to multiplying the complex sample (where im=0) by Complex::new(cos, sin).
-            samples
-                .iter()
-                .enumerate()
-                .map(|(i, &s)| {
-                    let angle = omega * i as f64 - phase0;
-                    s * Complex::new(angle.cos(), angle.sin()) * scale
-                })
-                .collect()
-        }
-    }
+        // Real R2C quadrature mixing: I = x[n]·cos(ωn), Q = -x[n]·sin(ωn) for a real input,
+        // which is the real sample times the NCO phasor.
+        MixerType::Fine => -2.0 * PI * nco_freq_mhz / sim_fs_mhz,
+    };
+
+    mix_with_nco(samples, omega, phase0, scale)
 }
+
+/// Multiply real samples by `scale · e^{j(ω·n − φ₀)}`.
+///
+/// The phasor is stepped rather than evaluated: `e^{jω(n+1)} = e^{jωn} · e^{jω}` costs one
+/// complex multiply where `cos`/`sin` per sample cost two transcendentals. Rounding creeps into
+/// the magnitude over a long record, so the phasor is renormalised periodically — see
+/// [`PHASOR_RENORM_INTERVAL`]. Chunks re-derive their own starting phasor from the absolute
+/// index, so splitting the work changes nothing about the result.
+fn mix_with_nco(samples: &[f64], omega: f64, phase0: f64, scale: f64) -> Vec<Complex<f64>> {
+    let rot = Complex::new(omega.cos(), omega.sin());
+
+    let run = |base: usize, dst: &mut [Complex<f64>]| {
+        let src = &samples[base..base + dst.len()];
+        let start = omega * base as f64 - phase0;
+        let mut z = Complex::new(start.cos(), start.sin()) * scale;
+        for (k, (&s, out)) in src.iter().zip(dst.iter_mut()).enumerate() {
+            *out = z * s;
+            z *= rot;
+            if k % PHASOR_RENORM_INTERVAL == 0 {
+                z *= scale / z.norm();
+            }
+        }
+    };
+
+    let mut mixed = vec![Complex::new(0.0, 0.0); samples.len()];
+    for_each_chunk(&mut mixed, run);
+    mixed
+}
+
+/// How often a stepped phasor is pulled back onto its circle.
+///
+/// Each step multiplies in one rounding error, so the magnitude drifts as roughly `√n · ε`.
+/// Renormalising this often keeps the drift near the `f64` floor for any record length, and
+/// costs one square root per thousand samples.
+pub(crate) const PHASOR_RENORM_INTERVAL: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // DDC decimation filter chain
@@ -1260,28 +1466,50 @@ impl DecimationChain {
         }
         let half = taps.len() / 2;
         let out_len = input.len() / m;
-        let mut out = Vec::with_capacity(out_len);
-        for idx in 0..out_len {
-            let center = idx * m;
-            let lo = center.saturating_sub(half);
-            let hi = (center + half).min(input.len() - 1);
-            // Taps are indexed relative to the centre sample, so the window is clipped at
-            // the buffer edges rather than wrapping.
-            let tap_offset = half - (center - lo);
-            let mut acc = Complex::new(0.0, 0.0);
-            for (x, &tap) in input[lo..=hi].iter().zip(&taps[tap_offset..]) {
-                acc += x * tap;
+
+        // Output `idx` depends only on the input window around `idx · m`, so the stage splits
+        // by output index with no state carried between chunks.
+        let run = |base: usize, dst: &mut [Complex<f64>]| {
+            for (k, out) in dst.iter_mut().enumerate() {
+                let center = (base + k) * m;
+                let lo = center.saturating_sub(half);
+                let hi = (center + half).min(input.len() - 1);
+                // Taps are indexed relative to the centre sample, so the window is clipped at
+                // the buffer edges rather than wrapping.
+                let tap_offset = half - (center - lo);
+                let mut acc = Complex::new(0.0, 0.0);
+                for (x, &tap) in input[lo..=hi].iter().zip(&taps[tap_offset..]) {
+                    acc += x * tap;
+                }
+                *out = acc;
             }
-            out.push(acc);
+        };
+
+        let mut out = vec![Complex::new(0.0, 0.0); out_len];
+        // Each output costs one pass over the taps, so it is the product that decides whether
+        // the stage is worth spreading — a short buffer through a long filter still is.
+        if out_len * taps.len() >= PAR_MIN_LEN {
+            out.par_chunks_mut(PAR_CHUNK)
+                .enumerate()
+                .for_each(|(c, dst)| run(c * PAR_CHUNK, dst));
+        } else {
+            run(0, &mut out);
         }
         out
     }
 
     /// Filter and downsample, returning only fully settled output samples.
     pub fn apply(&self, samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
-        let mut current = samples.to_vec();
-        for stage in &self.stages {
-            current = Self::run_stage(&current, &stage.taps, stage.factor);
+        if self.stages.is_empty() {
+            return samples.to_vec();
+        }
+        // The first stage reads the caller's buffer directly. Copying it in only to filter out
+        // of it is megabytes of traffic for nothing, and every later stage is already writing
+        // into a buffer of its own.
+        let mut current = Vec::new();
+        for (i, stage) in self.stages.iter().enumerate() {
+            let input = if i == 0 { samples } else { &current };
+            current = Self::run_stage(input, &stage.taps, stage.factor);
         }
         if self.warmup_out_samples < current.len() {
             current.drain(..self.warmup_out_samples);
@@ -1598,15 +1826,12 @@ mod tests {
         let tile_fs = 2000.0;
         let n = 8192;
 
-        let wideband: Vec<Complex<f64>> = (0..n)
-            .map(|i| {
-                let phi = 2.0 * PI * 1300.0 * i as f64 / sim_fs;
-                Complex::new(phi.cos(), 0.0)
-            })
+        let wideband: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * 1300.0 * i as f64 / sim_fs).cos())
             .collect();
 
         let sampled = sample_adc_at_tile_rate(&wideband, sim_fs, tile_fs);
-        let (folded, folded_freq) = compute_spectrum_positive(&sampled, 2048, tile_fs);
+        let (folded, folded_freq) = compute_spectrum_positive_real(&sampled, 2048, tile_fs);
 
         let (peak_idx, _) = folded
             .iter()
@@ -1625,11 +1850,11 @@ mod tests {
     fn coarse_mixer_fs_over_4() {
         let n = 256;
         let fs = 1000.0;
-        let samples: Vec<Complex<f64>> = (0..n)
+        // The mixer sees the converter's real output, so this is a cosine, not a phasor.
+        let samples: Vec<f64> = (0..n)
             .map(|i| {
                 let t = i as f64 / fs;
-                let angle = 2.0 * PI * 250.0 * t; // 250 MHz = Fs/4
-                Complex::new(angle.cos(), angle.sin())
+                (2.0 * PI * 250.0 * t).cos() // 250 MHz = Fs/4
             })
             .collect();
 
@@ -1645,18 +1870,21 @@ mod tests {
         let mixed = apply_mixer(&samples, &coarse_ms, 0.0, fs, fs, 1.0);
         assert_eq!(mixed.len(), n);
 
-        // After mixing with -Fs/4, a tone at Fs/4 should move to ~DC
-        let (spectrum, freq_axis) = compute_spectrum_positive(&mixed, n, fs);
-        let (peak_idx, _) = spectrum
+        // After mixing with −Fs/4, a real tone at Fs/4 puts its positive-frequency half at DC.
+        // Its negative half lands on −Fs/2, i.e. the Nyquist bin, and is just as strong — so
+        // this checks the level at DC rather than where the strongest bin happens to be.
+        let (spectrum, freq_axis) = compute_spectrum(&mixed, n, fs);
+        let peak = spectrum.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let dc_idx = freq_axis
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .unwrap();
-
-        let peak_freq = freq_axis[peak_idx];
+            .min_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
+            .unwrap()
+            .0;
         assert!(
-            peak_freq.abs() < fs / n as f64 * 2.0,
-            "After Fs/4 mix, peak should be near DC, got {peak_freq} MHz"
+            spectrum[dc_idx] > peak - 0.5,
+            "After Fs/4 mix, DC should carry the tone: DC {:.1} dBFS vs peak {peak:.1} dBFS",
+            spectrum[dc_idx]
         );
     }
 
@@ -1668,11 +1896,10 @@ mod tests {
         let n = 1024;
 
         // Generate a 1000 MHz tone sampled at 10,000 MHz
-        let samples: Vec<Complex<f64>> = (0..n)
+        let samples: Vec<f64> = (0..n)
             .map(|i| {
                 let t = i as f64 / sim_fs;
-                let angle = 2.0 * PI * 1000.0 * t; // 1000 MHz tone (= tile_fs / 4)
-                Complex::new(angle.cos(), angle.sin())
+                (2.0 * PI * 1000.0 * t).cos() // 1000 MHz tone (= tile_fs / 4)
             })
             .collect();
 
@@ -1794,12 +2021,8 @@ mod tests {
 
     #[test]
     fn adc_non_idealities_hd2_hd3() {
-        let samples: Vec<Complex<f64>> = (0..512)
-            .map(|i| {
-                let phi = 2.0 * PI * 0.1 * i as f64;
-                Complex::new(phi.cos(), 0.0) // Real voltage
-            })
-            .collect();
+        // Real voltage
+        let samples: Vec<f64> = (0..512).map(|i| (2.0 * PI * 0.1 * i as f64).cos()).collect();
 
         let mut non = crate::rfdc::AdcNonIdealities::default();
         non.enabled = true;
@@ -1809,7 +2032,7 @@ mod tests {
         let distorted = apply_analog_non_idealities(&samples, &non);
         assert_eq!(distorted.len(), samples.len());
         // Distorted samples should differ from pure sine
-        let diff: f64 = samples.iter().zip(distorted.iter()).map(|(a, b)| (a - b).norm()).sum();
+        let diff: f64 = samples.iter().zip(distorted.iter()).map(|(a, b)| (a - b).abs()).sum();
         assert!(diff > 1.0);
     }
 
@@ -2067,11 +2290,8 @@ mod tests {
         let n = 16384;
         let fs = 4000.0;
         let f0 = 300.0;
-        let samples: Vec<Complex<f64>> = (0..n)
-            .map(|i| {
-                let phi = 2.0 * PI * f0 * i as f64 / fs;
-                Complex::new(phi.cos(), 0.0)
-            })
+        let samples: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * f0 * i as f64 / fs).cos())
             .collect();
 
         let mut non = crate::rfdc::AdcNonIdealities::default();
@@ -2080,7 +2300,7 @@ mod tests {
         non.hd3_dbc = -50.0;
 
         let distorted = apply_analog_non_idealities(&samples, &non);
-        let (spec, freq) = compute_spectrum_positive(&distorted, n, fs);
+        let (spec, freq) = compute_spectrum_positive_real(&distorted, n, fs);
 
         let level_at = |target: f64| -> f64 {
             let idx = freq
@@ -2112,9 +2332,9 @@ mod tests {
         for enob in [8.0_f64, 11.5] {
             non.enob = enob;
             // Zero input: measure the noise power the converter contributes on its own.
-            let quiet = vec![Complex::new(0.0, 0.0); n];
+            let quiet = vec![0.0; n];
             let (noisy, _) = apply_digital_non_idealities(&quiet, &non);
-            let pwr: f64 = noisy.iter().map(|c| c.re * c.re).sum::<f64>() / n as f64;
+            let pwr: f64 = noisy.iter().map(|v| v * v).sum::<f64>() / n as f64;
             // Full-scale sine power is 0.5, so SNR = 10·log10(0.5 / noise power).
             let snr = 10.0 * (0.5 / pwr.max(1e-30)).log10();
             let expected = 6.02 * enob + 1.76;
@@ -2133,11 +2353,8 @@ mod tests {
         let n = 1024;
         let fs = 4000.0;
         let f0 = 500.0;
-        let samples: Vec<Complex<f64>> = (0..n)
-            .map(|i| {
-                let phi = 2.0 * PI * f0 * i as f64 / fs;
-                Complex::new(phi.cos(), 0.0)
-            })
+        let samples: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * f0 * i as f64 / fs).cos())
             .collect();
 
         let mixer = |phase_deg: f64| {
@@ -2285,19 +2502,15 @@ mod tests {
         let n = 8192;
         let fs = 15000.0;
         let f0 = 2600.0;
-        let samples: Vec<Complex<f64>> = (0..n)
-            .map(|i| {
-                let phi = 2.0 * PI * f0 * i as f64 / fs;
-                Complex::new(phi.cos(), 0.0)
-            })
+        let samples: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * f0 * i as f64 / fs).cos())
             .collect();
 
         let filtered = apply_analog_bandwidth(&samples, fs, &afe);
         assert_eq!(filtered.len(), n);
-        // Output must stay real.
-        assert!(filtered.iter().all(|c| c.im == 0.0));
+        assert!(filtered.iter().all(|v| v.is_finite()));
 
-        let (spec, freq) = compute_spectrum_positive(&filtered, n, fs);
+        let (spec, freq) = compute_spectrum_positive_real(&filtered, n, fs);
         let peak = spec.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
         // Expected in-band attenuation at 2600 MHz.
@@ -2322,14 +2535,14 @@ mod tests {
 
     #[test]
     fn clipping_overrange_flag() {
-        let samples: Vec<Complex<f64>> = vec![Complex::new(1.5, 0.0), Complex::new(-1.5, 0.0), Complex::new(0.5, 0.0)];
+        let samples: Vec<f64> = vec![1.5, -1.5, 0.5];
         let non = crate::rfdc::AdcNonIdealities::default(); // default has enabled=false for spur/quant, but clip still applies
         let (processed, overrange) = apply_digital_non_idealities(&samples, &non);
-        
+
         assert!(overrange);
-        assert_eq!(processed[0].re, 1.0);
-        assert_eq!(processed[1].re, -1.0);
-        assert_eq!(processed[2].re, 0.5);
+        assert_eq!(processed[0], 1.0);
+        assert_eq!(processed[1], -1.0);
+        assert_eq!(processed[2], 0.5);
     }
 
     #[test]
@@ -2339,11 +2552,9 @@ mod tests {
         let n = 256;
         let f_in = 100.0;
         
-        let samples: Vec<Complex<f64>> = (0..n)
-            .map(|i| {
-                let phi = 2.0 * PI * f_in * i as f64 / sim_fs;
-                Complex::new(phi.cos(), 0.0) // Real tone
-            })
+        // Real tone
+        let samples: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * f_in * i as f64 / sim_fs).cos())
             .collect();
             
         // Mix with 100 MHz NCO (shifts signal down by 100 MHz)
@@ -2443,11 +2654,8 @@ mod tests {
 
         let n = 256;
         let fs = 1000.0;
-        let samples: Vec<Complex<f64>> = (0..n)
-            .map(|i| {
-                let phi = 2.0 * PI * 100.0 * i as f64 / fs;
-                Complex::new(phi.cos(), 0.0)
-            })
+        let samples: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * 100.0 * i as f64 / fs).cos())
             .collect();
 
         let ms_r2c = MixerSettings {
@@ -2779,7 +2987,7 @@ mod tests {
     #[test]
     fn tabulated_resampler_matches_direct_evaluation() {
         /// The original per-sample evaluation, kept here as the reference.
-        fn direct(w: &[Complex<f64>], sim: f64, tile: f64) -> Vec<Complex<f64>> {
+        fn direct(w: &[f64], sim: f64, tile: f64) -> Vec<f64> {
             let ratio = sim / tile;
             let num = (w.len() as f64 / ratio).floor() as usize;
             let radius = RESAMPLER_RADIUS;
@@ -2808,11 +3016,10 @@ mod tests {
                             + 0.48829 * (PI * norm_x).cos()
                             + 0.14128 * (2.0 * PI * norm_x).cos()
                             + 0.01168 * (3.0 * PI * norm_x).cos();
-                        val += w[k as usize].re * sinc * window;
+                        val += w[k as usize] * sinc * window;
                         weight_sum += sinc * window;
                     }
-                    let v = if weight_sum.abs() > 1e-9 { val / weight_sum } else { 0.0 };
-                    Complex::new(v, 0.0)
+                    if weight_sum.abs() > 1e-9 { val / weight_sum } else { 0.0 }
                 })
                 .collect()
         }
@@ -2821,13 +3028,12 @@ mod tests {
         // 4000/2457.6/5000 divide the simulation rate into phases the table holds exactly;
         // 3930 does not, and exercises the interpolation between neighbouring phases.
         for tile_fs in [4000.0, 3930.0, 2457.6, 5000.0] {
-            let samples: Vec<Complex<f64>> = (0..4000)
+            let samples: Vec<f64> = (0..4000)
                 .map(|i| {
                     let t = i as f64 / sim_fs;
-                    let v = (2.0 * PI * 1234.5 * t).sin()
+                    (2.0 * PI * 1234.5 * t).sin()
                         + 0.3 * (2.0 * PI * 6789.0 * t).cos()
-                        + 0.05 * (2.0 * PI * 137.0 * t).sin();
-                    Complex::new(v, 0.0)
+                        + 0.05 * (2.0 * PI * 137.0 * t).sin()
                 })
                 .collect();
 
@@ -2838,9 +3044,9 @@ mod tests {
             let worst = reference
                 .iter()
                 .zip(&tabulated)
-                .map(|(a, b)| (a.re - b.re).abs())
+                .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max);
-            let rms = (reference.iter().map(|s| s.re * s.re).sum::<f64>()
+            let rms = (reference.iter().map(|s| s * s).sum::<f64>()
                 / reference.len() as f64)
                 .sqrt();
 
@@ -3067,7 +3273,126 @@ mod tests {
             "Blackman-Harris should push the leakage skirt far below Hanning's; got {bh_skirt:.1} vs {han_skirt:.1} dB"
         );
     }
+
+    /// The real-input transform is a speed change, not a modelling one: it has to agree with
+    /// running the same samples through the complex transform with a zero imaginary part.
+    #[test]
+    fn real_spectrum_matches_the_complex_transform() {
+        let n = 4096;
+        let fs = 4000.0;
+        let real: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                (2.0 * PI * 317.0 * t).cos() + 0.01 * (2.0 * PI * 1123.0 * t).sin()
+            })
+            .collect();
+        let complex: Vec<Complex<f64>> = real.iter().map(|&v| Complex::new(v, 0.0)).collect();
+
+        for window in FftWindow::ALL {
+            for pad in [1usize, 4] {
+                let (a, fa) = compute_spectrum_positive_padded_real(&real, n, fs, window, pad);
+                let (b, fb) = compute_spectrum_positive_padded(&complex, n, fs, window, pad);
+                assert_eq!(a.len(), b.len(), "{window} pad {pad}: bin count differs");
+                assert_eq!(fa, fb, "{window} pad {pad}: frequency axis differs");
+                let peak = b.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let worst_of = |floor_db: f64| {
+                    a.iter()
+                        .zip(&b)
+                        .filter(|&(_, &y)| y > peak - floor_db)
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0_f64, f64::max)
+                };
+                // Anywhere a signal lives, the two transforms agree to well past display
+                // precision. The last 100 dB is each algorithm's own rounding noise, where a
+                // vanishing absolute difference still reads as a visible one in dB.
+                assert!(
+                    worst_of(150.0) < 1e-6,
+                    "{window} pad {pad}: differs by {:.3e} dB above −150 dBc",
+                    worst_of(150.0)
+                );
+                assert!(
+                    worst_of(400.0) < 1e-3,
+                    "{window} pad {pad}: differs by {:.3e} dB at the floor",
+                    worst_of(400.0)
+                );
+            }
+        }
+    }
+
+    /// Every per-sample stage is chunked across threads above [`PAR_MIN_LEN`]. A chunk derives
+    /// its state from its own start index, so crossing that threshold must not change the
+    /// result — which this checks by running the same stage either side of it and comparing
+    /// the overlap.
+    #[test]
+    fn chunked_stages_agree_across_the_parallel_threshold() {
+        let short = PAR_MIN_LEN / 2;
+        let long = PAR_MIN_LEN * 2 + 77; // deliberately not a multiple of the chunk size
+        let sim_fs = 15000.0;
+        let tile_fs = 4000.0;
+        let wave = |i: usize| {
+            let t = i as f64 / sim_fs;
+            (2.0 * PI * 1234.5 * t).sin() + 0.3 * (2.0 * PI * 6789.0 * t).cos()
+        };
+        let short_in: Vec<f64> = (0..short).map(wave).collect();
+        let long_in: Vec<f64> = (0..long).map(wave).collect();
+
+        let worst = |a: &[f64], b: &[f64]| {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0_f64, f64::max)
+        };
+
+        // Resampler: the sequential run is a prefix of the parallel one, bar the last few
+        // outputs whose kernel runs off the end of the shorter buffer.
+        let a = sample_adc_at_tile_rate(&short_in, sim_fs, tile_fs);
+        let b = sample_adc_at_tile_rate(&long_in, sim_fs, tile_fs);
+        let settled = a.len() - RESAMPLER_TAPS;
+        assert!(
+            worst(&a[..settled], &b[..settled]) < 1e-12,
+            "resampler disagrees either side of the parallel threshold"
+        );
+
+        // Mixer: a phasor stepped within a chunk has to track the phase the direct evaluation
+        // would have given, at both lengths.
+        let ms = crate::rfdc::MixerSettings {
+            mixer_type: MixerType::Fine,
+            freq: 700.0,
+            phase_offset: 33.0,
+            ..Default::default()
+        };
+        let phase0 = 33.0 * PI / 180.0;
+        let omega = -2.0 * PI * 700.0 / tile_fs;
+        for input in [&short_in, &long_in] {
+            let mixed = apply_mixer(input, &ms, 700.0, tile_fs, tile_fs, 1.0);
+            let worst_err = mixed
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let angle = omega * i as f64 - phase0;
+                    let want = Complex::new(angle.cos(), angle.sin()) * input[i];
+                    (m - want).norm()
+                })
+                .fold(0.0_f64, f64::max);
+            assert!(
+                worst_err < 1e-9,
+                "stepped NCO drifted from the direct evaluation by {worst_err:.3e}"
+            );
+        }
+
+        // Digital non-idealities: the noise realisation is seeded from the absolute index, so
+        // the shorter run has to reproduce the longer one's opening samples exactly.
+        let mut non = crate::rfdc::AdcNonIdealities::default();
+        non.enabled = true;
+        non.enob = 10.0;
+        let (a, _) = apply_digital_non_idealities(&short_in, &non);
+        let (b, _) = apply_digital_non_idealities(&long_in, &non);
+        assert_eq!(
+            worst(&a, &b[..a.len()]),
+            0.0,
+            "the ADC noise floor is not reproducible across the parallel threshold"
+        );
+    }
 }
+
+
 
 
 

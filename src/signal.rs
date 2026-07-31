@@ -2,11 +2,63 @@
 
 #![allow(dead_code)]
 
+use crate::dsp::{PHASOR_RENORM_INTERVAL, for_each_chunk, splitmix64};
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 use std::path::PathBuf;
+
+/// Run `fill` over the buffer in chunks that can land on different threads.
+///
+/// Every waveform below is a function of absolute sample index alone, so `fill` is handed the
+/// index its chunk starts at and can re-derive whatever it needs — a start phase, a symbol
+/// number, a noise seed — rather than inheriting state from the chunk before it. Short buffers
+/// run on the calling thread, where the hand-off would cost more than the work.
+fn fill_chunks(
+    samples: &mut [Complex<f64>],
+    fill: impl Fn(usize, &mut [Complex<f64>]) + Sync + Send,
+) {
+    for_each_chunk(samples, fill);
+}
+
+/// A unit phasor advancing by a fixed phase step, for carriers evaluated sample by sample.
+///
+/// `cos(ω·n + φ)` per sample is a transcendental per sample; `e^{jω(n+1)} = e^{jωn} · e^{jω}`
+/// is one complex multiply. Rounding accumulates in the magnitude over a long run, so the
+/// phasor is pulled back onto the unit circle every [`PHASOR_RENORM_INTERVAL`] steps — which
+/// holds the error near the `f64` floor for any record length.
+struct Phasor {
+    z: Complex<f64>,
+    rot: Complex<f64>,
+    step: usize,
+}
+
+impl Phasor {
+    /// A phasor starting at `phase` and advancing `step_rad` per sample.
+    fn new(phase: f64, step_rad: f64) -> Self {
+        Self {
+            z: Complex::new(phase.cos(), phase.sin()),
+            rot: Complex::new(step_rad.cos(), step_rad.sin()),
+            step: 0,
+        }
+    }
+
+    /// `e^{jθ}` at the current phase — `.re` is its cosine, `.im` its sine — then advance.
+    fn next(&mut self) -> Complex<f64> {
+        let v = self.z;
+        self.advance();
+        v
+    }
+
+    fn advance(&mut self) {
+        self.z *= self.rot;
+        self.step += 1;
+        if self.step % PHASOR_RENORM_INTERVAL == 0 {
+            self.z /= self.z.norm();
+        }
+    }
+}
 
 /// Modulation applied to a tone.
 ///
@@ -602,12 +654,20 @@ impl SignalGenerator {
                 continue;
             }
 
+            // Phase advance per sample for this tone's carrier, shared by every branch that
+            // steps a phasor rather than evaluating a cosine per sample.
+            let carrier_step = 2.0 * PI * tone.frequency_mhz * dt;
+
             match &tone.modulation {
                 ToneModulation::Cw => {
-                    for (i, sample) in samples.iter_mut().enumerate() {
-                        let t = start_time_us + i as f64 * dt;
-                        sample.re += amp * carrier_phase(tone.frequency_mhz, t, phase_rad).cos();
-                    }
+                    fill_chunks(&mut samples, |base, chunk| {
+                        let t0 = start_time_us + base as f64 * dt;
+                        let mut carrier =
+                            Phasor::new(carrier_phase(tone.frequency_mhz, t0, phase_rad), carrier_step);
+                        for sample in chunk.iter_mut() {
+                            sample.re += amp * carrier.next().re;
+                        }
+                    });
                 }
                 ToneModulation::Square | ToneModulation::Sawtooth | ToneModulation::Triangle => {
                     let series = HarmonicSeries::new(
@@ -615,13 +675,16 @@ impl SignalGenerator {
                         tone.frequency_mhz,
                         sample_rate_mhz / 2.0,
                     );
-                    let mut stepper = series.stepper(
-                        carrier_phase(tone.frequency_mhz, start_time_us, phase_rad),
-                        2.0 * PI * tone.frequency_mhz * dt,
-                    );
-                    for sample in samples.iter_mut() {
-                        sample.re += amp * stepper.next_value();
-                    }
+                    fill_chunks(&mut samples, |base, chunk| {
+                        let t0 = start_time_us + base as f64 * dt;
+                        let mut stepper = series.stepper(
+                            carrier_phase(tone.frequency_mhz, t0, phase_rad),
+                            carrier_step,
+                        );
+                        for sample in chunk.iter_mut() {
+                            sample.re += amp * stepper.next_value();
+                        }
+                    });
                 }
                 ToneModulation::AmModulated { depth_percent, mod_freq_khz } => {
                     // Carrier-referenced, as signal generators are: the envelope peaks at
@@ -629,68 +692,90 @@ impl SignalGenerator {
                     // does overdrive whatever comes next.
                     let m = (depth_percent / 100.0).clamp(0.0, 1.0);
                     let f_m = mod_freq_khz / 1000.0;
-                    for (i, sample) in samples.iter_mut().enumerate() {
-                        let t = start_time_us + i as f64 * dt;
-                        let env = 1.0 + m * carrier_phase(f_m, t, 0.0).cos();
-                        sample.re += amp * env * carrier_phase(tone.frequency_mhz, t, phase_rad).cos();
-                    }
+                    let mod_step = 2.0 * PI * f_m * dt;
+                    fill_chunks(&mut samples, |base, chunk| {
+                        let t0 = start_time_us + base as f64 * dt;
+                        let mut carrier =
+                            Phasor::new(carrier_phase(tone.frequency_mhz, t0, phase_rad), carrier_step);
+                        let mut modulator = Phasor::new(carrier_phase(f_m, t0, 0.0), mod_step);
+                        for sample in chunk.iter_mut() {
+                            let env = 1.0 + m * modulator.next().re;
+                            sample.re += amp * env * carrier.next().re;
+                        }
+                    });
                 }
                 ToneModulation::FmModulated { dev_mhz, mod_freq_khz } => {
                     let f_m = mod_freq_khz / 1000.0;
                     // Modulation index beta = deviation / modulating frequency; the sideband
                     // amplitudes come out as the Bessel functions J_n(beta).
                     let beta = if f_m > 0.0 { dev_mhz / f_m } else { 0.0 };
-                    for (i, sample) in samples.iter_mut().enumerate() {
-                        let t = start_time_us + i as f64 * dt;
-                        let angle = carrier_phase(tone.frequency_mhz, t, phase_rad)
-                            + beta * carrier_phase(f_m, t, 0.0).sin();
-                        sample.re += amp * angle.cos();
-                    }
+                    // No phasor here: the carrier's phase is not advancing by a constant, and
+                    // recovering cos(θ + β·sinθ_m) from stepped phasors needs two
+                    // transcendentals where the direct form needs one.
+                    fill_chunks(&mut samples, |base, chunk| {
+                        for (k, sample) in chunk.iter_mut().enumerate() {
+                            let t = start_time_us + (base + k) as f64 * dt;
+                            let angle = carrier_phase(tone.frequency_mhz, t, phase_rad)
+                                + beta * carrier_phase(f_m, t, 0.0).sin();
+                            sample.re += amp * angle.cos();
+                        }
+                    });
                 }
                 ToneModulation::SweptChirp { sweep_period_us, triangular } => {
                     let period = sweep_period_us.max(1e-3);
                     let bw = if tone.bandwidth_mhz > 0.0 { tone.bandwidth_mhz } else { 100.0 };
                     let f_start = tone.frequency_mhz - bw / 2.0;
-                    for (i, sample) in samples.iter_mut().enumerate() {
-                        let t = start_time_us + i as f64 * dt;
-                        let tau = t.rem_euclid(period);
-                        let angle = chirp_phase(f_start, bw, period, tau, *triangular) + phase_rad;
-                        sample.re += amp * angle.cos();
-                    }
+                    let triangular = *triangular;
+                    fill_chunks(&mut samples, |base, chunk| {
+                        for (k, sample) in chunk.iter_mut().enumerate() {
+                            let t = start_time_us + (base + k) as f64 * dt;
+                            let tau = t.rem_euclid(period);
+                            let angle = chirp_phase(f_start, bw, period, tau, triangular) + phase_rad;
+                            sample.re += amp * angle.cos();
+                        }
+                    });
                 }
                 ToneModulation::PulsedRadar { pulse_width_us, pri_us, rise_ns, chirp_mhz } => {
                     let pri = pri_us.max(1e-3);
                     let pw = pulse_width_us.clamp(1e-4, pri);
                     let rise = (rise_ns / 1000.0).clamp(0.0, pw / 2.0);
-                    for (i, sample) in samples.iter_mut().enumerate() {
-                        let t = start_time_us + i as f64 * dt;
-                        let tau = t.rem_euclid(pri);
-                        let env = pulse_envelope(tau, pw, rise);
-                        if env <= 0.0 {
-                            continue;
+                    let chirp_mhz = *chirp_mhz;
+                    fill_chunks(&mut samples, |base, chunk| {
+                        for (k, sample) in chunk.iter_mut().enumerate() {
+                            let t = start_time_us + (base + k) as f64 * dt;
+                            let tau = t.rem_euclid(pri);
+                            let env = pulse_envelope(tau, pw, rise);
+                            if env <= 0.0 {
+                                continue;
+                            }
+                            // The carrier stays coherent pulse to pulse, as a real coherent
+                            // radar does, and the intra-pulse chirp restarts with each pulse.
+                            let mut angle = carrier_phase(tone.frequency_mhz, t, phase_rad);
+                            if chirp_mhz > 0.0 {
+                                angle +=
+                                    chirp_phase(-chirp_mhz / 2.0, chirp_mhz, pw, tau.min(pw), false);
+                            }
+                            sample.re += amp * env * angle.cos();
                         }
-                        // The carrier stays coherent pulse to pulse, as a real coherent radar
-                        // does, and the intra-pulse chirp restarts with each pulse.
-                        let mut angle = carrier_phase(tone.frequency_mhz, t, phase_rad);
-                        if *chirp_mhz > 0.0 {
-                            angle += chirp_phase(-chirp_mhz / 2.0, *chirp_mhz, pw, tau.min(pw), false);
-                        }
-                        sample.re += amp * env * angle.cos();
-                    }
+                    });
                 }
                 ToneModulation::FreqHopping { hop_step_mhz, num_channels, hop_rate_hz } => {
                     let n_chan = (*num_channels).max(1);
                     let hop_dur = 1e6 / hop_rate_hz.max(1e-3);
-                    for (i, sample) in samples.iter_mut().enumerate() {
-                        let t = start_time_us + i as f64 * dt;
-                        let hop_idx = (t / hop_dur).floor() as i64;
-                        let chan = hop_channel(hop_idx, n_chan);
-                        let offset = (chan as f64 - (n_chan as f64 - 1.0) / 2.0) * hop_step_mhz;
-                        let f_inst = (tone.frequency_mhz + offset).max(1e-6);
-                        // Each hop lands wherever its own free-running phase would be, so hops
-                        // are not phase-coherent with each other — as in a real hopping radio.
-                        sample.re += amp * carrier_phase(f_inst, t, phase_rad).cos();
-                    }
+                    let hop_step_mhz = *hop_step_mhz;
+                    fill_chunks(&mut samples, |base, chunk| {
+                        for (k, sample) in chunk.iter_mut().enumerate() {
+                            let t = start_time_us + (base + k) as f64 * dt;
+                            let hop_idx = (t / hop_dur).floor() as i64;
+                            let chan = hop_channel(hop_idx, n_chan);
+                            let offset = (chan as f64 - (n_chan as f64 - 1.0) / 2.0) * hop_step_mhz;
+                            let f_inst = (tone.frequency_mhz + offset).max(1e-6);
+                            // Each hop lands wherever its own free-running phase would be, so
+                            // hops are not phase-coherent with each other — as in a real
+                            // hopping radio.
+                            sample.re += amp * carrier_phase(f_inst, t, phase_rad).cos();
+                        }
+                    });
                 }
                 ToneModulation::DigitalQpsk { symbol_rate_msps, rrc_alpha } => {
                     let rs = symbol_rate_msps.max(1e-3);
@@ -709,19 +794,25 @@ impl SignalGenerator {
                     let symbols: Vec<Complex<f64>> =
                         (first_sym..=last_sym).map(qpsk_symbol).collect();
 
-                    for (i, sample) in samples.iter_mut().enumerate() {
-                        let t = start_time_us + i as f64 * dt;
-                        let x = t / sym_dur;
-                        let centre = x.floor() as i64;
-                        let mut acc = Complex::new(0.0, 0.0);
-                        for k in (centre - RRC_SPAN)..=(centre + RRC_SPAN) {
-                            let sym = symbols[(k - first_sym).clamp(0, symbols.len() as i64 - 1) as usize];
-                            acc += sym * table.at(x - k as f64);
+                    fill_chunks(&mut samples, |base, chunk| {
+                        let t0 = start_time_us + base as f64 * dt;
+                        let mut carrier =
+                            Phasor::new(carrier_phase(tone.frequency_mhz, t0, phase_rad), carrier_step);
+                        for (k, sample) in chunk.iter_mut().enumerate() {
+                            let t = start_time_us + (base + k) as f64 * dt;
+                            let x = t / sym_dur;
+                            let centre = x.floor() as i64;
+                            let mut acc = Complex::new(0.0, 0.0);
+                            for s in (centre - RRC_SPAN)..=(centre + RRC_SPAN) {
+                                let sym = symbols
+                                    [(s - first_sym).clamp(0, symbols.len() as i64 - 1) as usize];
+                                acc += sym * table.at(x - s as f64);
+                            }
+                            // Real passband signal: I on the cosine, Q on the sine.
+                            let theta = carrier.next();
+                            sample.re += shape * (acc.re * theta.re - acc.im * theta.im);
                         }
-                        // Real passband signal: I on the cosine, Q on the sine.
-                        let theta = carrier_phase(tone.frequency_mhz, t, phase_rad);
-                        sample.re += shape * (acc.re * theta.cos() - acc.im * theta.sin());
-                    }
+                    });
                 }
             }
         }
@@ -734,29 +825,36 @@ impl SignalGenerator {
         // discarded, so the floor read 3 dB below its setting.
         if self.noise_enabled {
             let noise_amp = 10.0_f64.powf(self.noise_floor_dbfs / 20.0);
-            let mut seed: u64 = 0xDEAD_BEEF_CAFE_BABE ^ (start_time_us.to_bits());
-            let mut spare: Option<f64> = None;
+            let base_seed: u64 = 0xDEAD_BEEF_CAFE_BABE ^ (start_time_us.to_bits());
 
-            for sample in &mut samples {
-                let g = match spare.take() {
-                    Some(v) => v,
-                    None => {
-                        let mut next_unit = || {
-                            seed ^= seed << 13;
-                            seed ^= seed >> 7;
-                            seed ^= seed << 17;
-                            (seed >> 11) as f64 / (1u64 << 53) as f64
-                        };
-                        let u1 = next_unit().max(1e-300);
-                        let u2 = next_unit();
-                        let r = (-2.0 * u1.ln()).sqrt();
-                        let theta = 2.0 * PI * u2;
-                        spare = Some(r * theta.sin());
-                        r * theta.cos()
-                    }
-                };
-                sample.re += noise_amp * g;
-            }
+            // Each chunk draws from its own stream, seeded from where it starts, so the floor
+            // is reproducible for a given capture however the work was divided — the same
+            // property the single stream gave, without the sample-to-sample dependency that
+            // would pin the whole record to one thread.
+            fill_chunks(&mut samples, |base, chunk| {
+                let mut seed = base_seed ^ splitmix64(base as u64 + 1);
+                let mut spare: Option<f64> = None;
+                for sample in chunk.iter_mut() {
+                    let g = match spare.take() {
+                        Some(v) => v,
+                        None => {
+                            let mut next_unit = || {
+                                seed ^= seed << 13;
+                                seed ^= seed >> 7;
+                                seed ^= seed << 17;
+                                (seed >> 11) as f64 / (1u64 << 53) as f64
+                            };
+                            let u1 = next_unit().max(1e-300);
+                            let u2 = next_unit();
+                            let r = (-2.0 * u1.ln()).sqrt();
+                            let theta = 2.0 * PI * u2;
+                            spare = Some(r * theta.sin());
+                            r * theta.cos()
+                        }
+                    };
+                    sample.re += noise_amp * g;
+                }
+            });
         }
 
         samples
@@ -1139,6 +1237,51 @@ mod tests {
             assert!(
                 (peak - 1.0).abs() < 0.02,
                 "{label} peaked at {peak}, expected full scale"
+            );
+        }
+    }
+
+    /// Stepping a phasor replaced a cosine per sample. It is a speed change only: the waveform
+    /// has to stay the one the direct evaluation gives, over a record long enough to cross the
+    /// parallel threshold and at a simulation time far from zero, where the phase has had room
+    /// to drift.
+    #[test]
+    fn stepped_carriers_match_direct_evaluation() {
+        let n = crate::dsp::PAR_MIN_LEN * 2 + 101;
+        let f = 2749.0;
+        let phase_deg = 41.0;
+        let dt = 1.0 / FS;
+
+        for start_us in [0.0, 973.0] {
+            let g = SignalGenerator {
+                tones: vec![Tone {
+                    frequency_mhz: f,
+                    amplitude_dbfs: 0.0,
+                    phase_deg,
+                    bandwidth_mhz: 0.0,
+                    modulation: ToneModulation::Cw,
+                }],
+                noise_floor_dbfs: -300.0,
+                noise_enabled: false,
+            };
+            let s = g.generate_at_time(n, FS, start_us);
+            let phase_rad = phase_deg * PI / 180.0;
+            let worst = s
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let t = start_us + i as f64 * dt;
+                    (v.re - carrier_phase(f, t, phase_rad).cos()).abs()
+                })
+                .fold(0.0_f64, f64::max);
+            // The reference is the one that loses ground as time passes: it takes the
+            // fractional part of `f · t`, a product carrying about `ε · f · t` cycles of its
+            // own rounding error, which at 973 µs is already a few parts in 10⁹. The stepped
+            // phasor restarts from that same value every chunk and drifts no further.
+            let tol = 1e-9 + 2.0 * PI * f * start_us * f64::EPSILON;
+            assert!(
+                worst < tol,
+                "stepped carrier drifted {worst:.3e} from the direct evaluation at t = {start_us} µs (tolerance {tol:.3e})"
             );
         }
     }
