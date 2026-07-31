@@ -13,12 +13,13 @@ use std::path::PathBuf;
 /// Everything here is a **real** waveform. The analog domain carries one real voltage and the
 /// converter samples only that, so a "complex tone" option would be indistinguishable from a
 /// cosine — which is why there is one carrier variant rather than three.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum ToneModulation {
     /// Unmodulated carrier: a real sine wave at `phase_deg`.
     ///
     /// Give the tone a non-zero `bandwidth_mhz` and it becomes a modulated channel of that
     /// width instead of a single line.
+    #[default]
     #[serde(alias = "RealCosine", alias = "RealSine")]
     Cw,
     /// Square wave, band-limited to a finite number of harmonics.
@@ -50,12 +51,6 @@ pub enum ToneModulation {
     },
     /// QPSK with pseudo-random data and root-raised-cosine pulse shaping.
     DigitalQpsk { symbol_rate_msps: f64, rrc_alpha: f64 },
-}
-
-impl Default for ToneModulation {
-    fn default() -> Self {
-        ToneModulation::Cw
-    }
 }
 
 impl ToneModulation {

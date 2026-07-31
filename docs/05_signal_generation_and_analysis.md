@@ -4,16 +4,29 @@ This document details how the simulator generates complex test vectors and how i
 
 ## Signal Generation (`src/signal.rs`)
 
-To rigorously test the RFSoC datapath, the simulator includes a robust, wideband signal generator capable of producing multiple parallel waveforms. 
+To rigorously test the RFSoC datapath, the simulator includes a wideband generator producing any number of parallel tones. **Every waveform is real**, because the analog domain carries one real voltage and the converter samples only that — a "complex tone" option would be indistinguishable from a cosine once it reached the ADC pin, which is why there is one carrier variant rather than three.
 
-1. **Continuous Wave (CW):** Produces pure sine tones. Give a tone a non-zero **channel bandwidth** and it becomes a modulated channel instead of a line: the in-band FFT bins are filled with random phase and transformed back, which is what a real carrier with data on it looks like — flat, exactly the requested width, and carrying the same total power as the tone it replaces.
-2. **Frequency Modulation (FM):** Modulates the instantaneous frequency of the carrier.
-3. **Swept Chirps:** Linearly sweeps the frequency across a bandwidth over a given time period. This is essential for testing the transition bands of decimation filters.
-4. **Pulsed Radar:** Turns the signal on and off with a specified Duty Cycle and Pulse Repetition Interval (PRI).
-5. **AWGN Noise Floor:** Synthesizes an Additive White Gaussian Noise floor at a specific dBFS level, as a test vector for dynamic-range work. It goes into the real voltage only — the one quantity a wire carries, and the only part the converter samples — so the measured floor lands on its setting rather than 3 dB below it. Note this is a *total power* figure, so its on-screen level moves with FFT length; the chain's own **physical** noise is the $kTB$-based thermal model in `src/node_graph/components.rs`, which is properly a power spectral density.
+| Waveform | What it produces |
+| --- | --- |
+| **CW carrier** | A single line. Give it a non-zero **channel bandwidth** and it becomes a modulated channel instead: the in-band FFT bins are filled with random phase and transformed back, which is what a carrier with data on it looks like — flat, exactly the requested width, and carrying the same power as the tone it replaces. |
+| **Square / Sawtooth / Triangle** | Built by summing only the harmonics that fit below Nyquist (odd·1/n, all·1/n, odd·1/n² respectively). Evaluating the ideal shape at the sample rate instead folds every harmonic above Nyquist back into the band, and in a simulator built to teach Nyquist behaviour those aliases are indistinguishable from real signals. The harmonic ceiling doubles as the finite rise time every real generator has. |
+| **AM** | Carrier-referenced, as instruments are: sidebands at $m/2$, and an envelope peaking at $(1+m)$ times the carrier — so deep modulation of a hot carrier really does overdrive what follows. |
+| **FM** | Sidebands land on the Bessel functions $J_n(\beta)$, including the carrier null at $\beta = 2.405$. |
+| **FMCW chirp** | Linear sweep across the bandwidth, with sawtooth or **triangular** retrace. Triangular carries the phase through the turn, which is what lets a real FMCW radar separate range from Doppler. |
+| **Pulsed radar** | Coherent pulse train with a **raised-cosine edge** (a perfectly rectangular pulse has skirts reaching to infinity) and an optional **intra-pulse LFM chirp** for pulse compression, the waveform most real radars actually transmit. |
+| **Frequency hopping** | Hops a channel grid on a hashed sequence. The previous stride-based sequence shared a factor with any channel count that was a multiple of the stride — seven channels sat on channel 3 and never moved. |
+| **QPSK** | Pseudo-random symbols with **root-raised-cosine** shaping, occupying $(1+\alpha)R_s$. The previous symbol sequence repeated every four symbols, making a handful of discrete lines rather than a modulated channel. |
+| **AWGN floor** | Injected into the real voltage only — the one quantity a wire carries — so the measured floor lands on its setting rather than 3 dB below it. This is a *total power* figure, so its on-screen level moves with FFT length; the chain's own **physical** noise is the $kTB$ model in `src/node_graph/components.rs`, which is properly a power spectral density. |
 
 ### Time-Domain Continuity
-Crucially, the signal generator is fully time-aware. It uses a continuous phase accumulator tied to the global simulation time $t$. This ensures that when the simulator re-evaluates the pipeline, the generated signals do not suffer from phase discontinuities or spectral leakage artifacts caused by block-based processing.
+
+The generator is fully time-aware: every waveform is a closed form in the absolute simulation timestamp rather than a running accumulator, so a frame starting at $t$ contains exactly the samples a longer run through $t$ would have produced. There is a test asserting this for every modulation, because anything that resets a phase accumulator shows up as a seam in the waterfall.
+
+Two exceptions are deliberate, and both are what the real thing does: a sawtooth chirp jumps in phase at retrace, and frequency hops are not phase-coherent with each other.
+
+### Verifying the Waveforms
+
+Each modulation is checked against the textbook result rather than merely for "some energy": harmonic amplitude ratios and the absence of aliases, AM sideband depth, FM Bessel sidebands and the carrier null, chirp occupancy and continuity through the turn, pulse duty cycle and PRF line spacing, the energy a raised-cosine edge removes, hop-sequence coverage of the channel grid, and QPSK occupied bandwidth against $(1+\alpha)R_s$.
 
 ## Spectral Analysis (FFT & Windowing)
 
